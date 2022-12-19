@@ -1,0 +1,59 @@
+# @package _group_
+
+_name: lm_debug
+
+criterion:
+  _name: cross_entropy
+
+common:
+  _name: lm_debug
+  no_progress_bar: true
+  log_interval: 1
+  seed: 1
+  cpu: true
+  fp16: false
+
+model:
+  _name: staircase_lm
+
+task:
+  _name: chomsky_hierarchy
+
+dataset:
+  max_tokens: 512
+  skip_invalid_size_inputs_valid_test: true
+  required_batch_size_multiple: 1
+  validate_interval: 10000000
+  fixed_validation_seed: 1
+  batch_size: 32
+  #train_subset: example
+  # valid_subset: ???
+
+optimizer:
+  _name: adam
+
+optimization:
+  max_epoch: 10
+  max_update: 100
+  update_freq:
+    - 1
+  lr:
+    - 5e-4
+
+lr_scheduler:
+  _name: polynomial_decay
+  warmup_updates: 1
+
+checkpoint:
+  save_interval_updates: 100
+  keep_interval_updates: 200
+  keep_interval_updates_pattern: -1
+  keep_last_epochs: 0
+  keep_best_checkpoints: -1
+  no_save: true
+  no_epoch_checkpoints: false
+  no_last_checkpoints: false
+
+hydra:
+  job:
+    name: dummy_lm
