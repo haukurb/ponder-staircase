@@ -18,7 +18,7 @@ model:
   use_alibi: false
   num_bottom_layers: 2
   num_staircase_layers: 2
-  num_top_layers: 1
+  num_top_layers: 0
   share_decoder_input_output_embed: true
   decoder:
       input_dim: 64
@@ -30,22 +30,23 @@ model:
 task:
   _name: language_modeling
   data: ???
+  sample_break_mode: eos
 
 dataset:
-  max_tokens: 512
   skip_invalid_size_inputs_valid_test: true
   required_batch_size_multiple: 1
   validate_interval: 10000000
   fixed_validation_seed: 1
-  batch_size: 32
+  batch_size: 128
+  #max_tokens: 1024
   #train_subset: example
-  # valid_subset: ???
+  #valid_subset: ???
 
 optimizer:
   _name: adam
 
 optimization:
-  max_epoch: 10
+  max_epoch: 2
   max_update: 100
   update_freq:
     - 1
