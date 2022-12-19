@@ -1,17 +1,19 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from icecream import ic
 
+from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.distributed import fsdp_wrap
 from fairseq.models.transformer import TransformerConfig
-from fairseq.utils import safe_getattr, safe_hasattr
+from fairseq.utils import safe_getattr
 from fairseq.models.transformer_lm import (
     TransformerLanguageModel,
     TransformerLanguageModelConfig,
 )
+from fairseq.modules import AdaptiveInput, CharacterTokenEmbedder
 from fairseq.models.transformer.transformer_decoder import (
     TransformerDecoderBase,
-    TransformerDecoder,
 )
 from fairseq.modules.transformer_layer import TransformerDecoderLayerBase
 from fairseq.models import (
@@ -53,69 +55,47 @@ to get alibi attention we need to do more surgical things:
 
 
 @dataclass
-class StaircaseTransformerLanguageModelConfig(TransformerLanguageModelConfig):
-    use_alibi: bool = False
+class StaircaseTransformerConfig(TransformerConfig):
+    num_bottom_layers: int = field(default=0)
+    num_staircase_layers: int = field(default=4)
+    num_top_layers: int = field(default=1)
+    use_alibi: bool = field(default=False)
+
+    def __post_init__(self):
+        self.decoder.layers = self.num_bottom_layers + self.num_staircase_layers + self.num_top_layers
 
 
-@register_model("staircase_lm", dataclass=StaircaseTransformerLanguageModelConfig)
+# @dataclass
+# class StaircaseTransformerLanguageModelConfig(TransformerLanguageModelConfig):
+#     num_base_layers: int = field(default=0)
+#     num_top_layers: int = field(default=1)
+#     num_staircase_layers: int = field(default=4)
+#     use_alibi: bool = field(default=False)
+#     staircase: StaircaseTransformerConfig = field(default_factory=StaircaseTransformerConfig)
+#     # pass
+
+
+# @register_model("staircase_lm", dataclass=StaircaseTransformerLanguageModelConfig)
+@register_model("staircase_lm", dataclass=StaircaseTransformerConfig)
 class StaircaseTransformerDecoderModel(TransformerLanguageModel):
     def __init__(self, decoder):
         super().__init__(decoder)
 
     @classmethod
-    def build_model(cls, args, task):
+    def build_model(cls, cfg, task):
         """Build a new model instance."""
 
-        if args.decoder_layers_to_keep:
-            args.decoder_layers = len(args.decoder_layers_to_keep.split(","))
+        assert cfg.decoder.input_dim == cfg.decoder.embed_dim
+        embed_tokens = cls.build_embedding(
+            cfg, task.source_dictionary, cfg.decoder.embed_dim
+        )
 
-        if safe_getattr(args, "max_target_positions", None) is None:
-            args.max_target_positions = safe_getattr(
-                args, "tokens_per_sample", DEFAULT_MAX_TARGET_POSITIONS
-            )
-
-        if args.character_embeddings:
-            embed_tokens = CharacterTokenEmbedder(
-                task.source_dictionary,
-                eval(args.character_filters),
-                args.character_embedding_dim,
-                args.decoder_embed_dim,
-                args.char_embedder_highway_layers,
-            )
-        elif args.adaptive_input:
-            embed_tokens = AdaptiveInput(
-                len(task.source_dictionary),
-                task.source_dictionary.pad(),
-                args.decoder_input_dim,
-                args.adaptive_input_factor,
-                args.decoder_embed_dim,
-                options.eval_str_list(args.adaptive_input_cutoff, type=int),
-                args.quant_noise_pq,
-                args.quant_noise_pq_block_size,
-            )
-        else:
-            embed_tokens = cls.build_embedding(
-                args, task.source_dictionary, args.decoder_input_dim
-            )
-
-        if args.tie_adaptive_weights:
-            assert args.adaptive_input
-            assert args.adaptive_input_factor == args.adaptive_softmax_factor
-            assert (
-                args.adaptive_softmax_cutoff == args.adaptive_input_cutoff
-            ), "{} != {}".format(
-                args.adaptive_softmax_cutoff, args.adaptive_input_cutoff
-            )
-            assert args.decoder_input_dim == args.decoder_output_dim
-
-        use_alibi = args.use_alibi
-        cfg = TransformerConfig.from_namespace(args)
+        # cfg = StaircaseTransformerConfig.from_namespace(args)
         decoder = StaircaseTransformerDecoder(
             cfg,
             task.target_dictionary,
             embed_tokens,
             no_encoder_attn=True,
-            use_alibi=use_alibi,
         )
         return cls(decoder)
 
@@ -123,14 +103,12 @@ class StaircaseTransformerDecoderModel(TransformerLanguageModel):
 class StaircaseTransformerDecoder(TransformerDecoderBase):
     def __init__(
         self,
-        cfg,
+        cfg: TransformerConfig,
         dictionary,
         embed_tokens,
         no_encoder_attn=False,
         output_projection=None,
-        use_alibi=False,
     ):
-        self.use_alibi = use_alibi
         super().__init__(
             cfg,
             dictionary,
@@ -140,7 +118,8 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         )
 
     def build_decoder_layer(self, cfg, no_encoder_attn=False):
-        if self.use_alibi:
+        if cfg.use_alibi:
+            assert False
             layer = TransformerAlibiDecoderLayerBase(cfg, no_encoder_attn)
         else:
             layer = TransformerDecoderLayerBase(cfg, no_encoder_attn)
