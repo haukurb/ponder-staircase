@@ -51,6 +51,11 @@ from torch import Tensor
 class StaircaseCache:
     finalized_chunks: List[torch.Tensor] = field(default_factory=list)
 
+    @property
+    def num_vecs(self):
+        cache_len = sum(chunk.shape[0] for chunk in self.finalized_chunks)
+        return cache_len
+
 
 @dataclass
 class StaircaseTransformerConfig(TransformerConfig):
@@ -328,19 +333,26 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             else:
                 self_attn_mask = None
 
-            curr_slen = x.shape[0]
-            curr_self_attn_padding_mask = (
-                self_attn_padding_mask[:, :curr_slen]
-                if self_attn_padding_mask is not None
-                else None
-            )
+            # XXX TODO: self_attn_mask will not work during inference (we don't properly handle incremental_state)
+            assert incremental_state is None
+            nqueries = x.shape[0]
+            curr_self_attn_mask = self_attn_mask
+            if cache.num_vecs > 0:
+                assert isinstance(self_attn_mask, torch.FloatTensor)
+                # mask is additive, not multiplicative
+                curr_self_attn_mask = torch.cat([self_attn_mask.new_zeros(nqueries, cache.num_vecs), self_attn_mask], dim=1)
+
+            # self_attn_padding_mask: [Batch, KeySeqLen]
+            curr_self_attn_padding_mask = self_attn_padding_mask
+            if self_attn_padding_mask is not None:
+                curr_self_attn_padding_mask = self_attn_padding_mask[:, :cache.num_vecs + nqueries]
 
             x, layer_attn, _ = layer(
                 x,
                 None,  # enc_out
                 None,  # encoder_padding_mask
                 incremental_state,
-                self_attn_mask=self_attn_mask,
+                self_attn_mask=curr_self_attn_mask,
                 self_attn_padding_mask=curr_self_attn_padding_mask,
                 need_attn=False,
                 need_head_weights=False,
@@ -492,12 +504,10 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
             query=x,
             key=x_with_cache,
             value=x_with_cache,
-            key_padding_mask=None,
             incremental_state=incremental_state,
             need_weights=False,
-            attn_mask=None,
-            #     key_padding_mask=self_attn_padding_mask,
-            #     attn_mask=self_attn_mask,
+            key_padding_mask=self_attn_padding_mask,
+            attn_mask=self_attn_mask,
         )
         # end modification of original function
 
