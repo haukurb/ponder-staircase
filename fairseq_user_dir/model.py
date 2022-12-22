@@ -2,7 +2,6 @@
 This file is borrows heavily from fairseq, specifically from the following files:
    - fairseq/models/transformer_lm.py
    - fairseq/models/transformer/transformer_decoder.py
-   - fairseq/models/transformer/transformer_decoder.py
    - fairseq/modules/transformer_layer.py
    - fairseq/models/fairseq_model.py
 
@@ -227,6 +226,19 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         if encoder_out is not None and len(encoder_out["encoder_padding_mask"]) > 0:
             encoder_padding_mask = encoder_out["encoder_padding_mask"][0]
 
+        """
+        begin modification of original function:
+
+        XXX: consider adding cyclic absolute positional embeddings to test hypothesis of chomsky hierarchy paper
+        also consider making those cyclic absolute positional embeddings disjoint i.e. it is not limited to:
+            0 1 2 3 4 5 6 7 8...
+        but can also be:
+            0 1 2 3 7 8 9 10 11..
+                    ^--- 4,5,6 were skipped
+
+        end modification of original function
+        """
+
         # embed positions
         positions = None
         if self.embed_positions is not None:
@@ -265,7 +277,10 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
             self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
 
-        # begin modification of original function
+        """
+        begin modification of original function:
+        """
+
         # decoder layers
         attn: Optional[Tensor] = None
         inner_states: List[Optional[Tensor]] = [x]
@@ -402,7 +417,10 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                 need_head_weights=False,
             )
             inner_states.append(x)
-        # end modification of original function
+
+        """
+        end modification of original function
+        """
 
         if attn is not None:
             # average probabilities over heads
@@ -494,7 +512,9 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
         else:
             y = x
 
-        # begin modification of original function
+        """
+        begin modification of original function
+        """
         if key_cache is None:
             x_with_cache = x
         else:
@@ -509,7 +529,9 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
             key_padding_mask=self_attn_padding_mask,
             attn_mask=self_attn_mask,
         )
-        # end modification of original function
+        """
+        end modification of original function
+        """
 
         if self.c_attn is not None:
             tgt_len, bsz = x.size(0), x.size(1)

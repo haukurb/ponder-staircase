@@ -15,9 +15,21 @@ common:
 
 model:
   _name: staircase_lm
+  num_bottom_layers: 2
+  num_staircase_layers: 2
+  num_top_layers: 0
+  share_decoder_input_output_embed: true
+  decoder:
+      input_dim: 64
+      output_dim: ${model.decoder.embed_dim}
+      embed_dim: 64
+      ffn_embed_dim: 256
+      attention_heads: 8
+
 
 task:
   _name: chomsky_hierarchy
+  task_name: "parity_check"
 
 dataset:
   max_tokens: 512
@@ -26,6 +38,7 @@ dataset:
   validate_interval: 10000000
   fixed_validation_seed: 1
   batch_size: 32
+  num_workers: 0
   #train_subset: example
   # valid_subset: ???
 
