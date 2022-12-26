@@ -115,7 +115,7 @@ class StaircaseTransformerDecoderModel(TransformerLanguageModel):
         # cfg = StaircaseTransformerConfig.from_namespace(args)
         decoder = StaircaseTransformerDecoder(
             cfg,
-            task.target_dictionary,
+            task.source_dictionary,
             embed_tokens,
             no_encoder_attn=True,
         )

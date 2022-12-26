@@ -1,8 +1,11 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, MISSING
+from typing import Optional
+from pathlib import Path
+import time
 
+from fairseq.data import data_utils
 from fairseq.data.data_utils import collate_tokens
 import numpy as np
-import math
 import torch
 import haiku as hk
 from fairseq.data.fairseq_dataset import FairseqDataset
@@ -14,23 +17,9 @@ from fairseq.tasks.language_modeling import LanguageModelingConfig, LanguageMode
 from icecream import ic
 from neural_networks_chomsky_hierarchy.training import constants
 from omegaconf import DictConfig, II
+import logging
 
-# seed = 1
-# rng_seq = hk.PRNGSequence(seed)
-# all_task_names = ['modular_arithmetic', 'parity_check', 'even_pairs', 'cycle_navigation', 'modular_arithmetic_brackets', 'reverse_string', 'missing_duplicate_string', 'duplicate_string', 'binary_addition', 'binary_multiplication', 'compute_sqrt', 'odds_first', 'solve_equation', 'stack_manipulation', 'bucket_sort']
-# task_name = "even_pairs"
-# for task_name in all_task_names[1:]:
-#     kwargs = {}
-#     if  "solve_equation" == task_name:
-#         kwargs["modulus"] = 3
-#     if "modular" in task_name:
-#         kwargs["modulus"] = 3
-#     if task_name in ("reverse_string", "duplicate_string", "odds_first"):
-#         kwargs["vocab_size"] = 3
-#     ic(task_name)
-#     task = constants.TASK_BUILDERS[task_name](**kwargs)
-#     ic(task.sample_batch(next(rng_seq), length=5, batch_size=1))
-# ic(constants.TASK_BUILDERS.keys())
+logger = logging.getLogger(__name__)
 
 CHOMSKY_SUBTASK_CHOICES = ChoiceEnum(
     [
@@ -38,23 +27,24 @@ CHOMSKY_SUBTASK_CHOICES = ChoiceEnum(
         "parity_check",
         "even_pairs",
         "cycle_navigation",
+        "duplicate_string",
+        "missing_duplicate_string",
         "modular_arithmetic_brackets",
         "reverse_string",
-        "missing_duplicate_string",
-        "duplicate_string",
         "binary_addition",
         "binary_multiplication",
+        "bucket_sort",
         "compute_sqrt",
         "odds_first",
         "solve_equation",
         "stack_manipulation",
-        "bucket_sort",
     ]
 )
 
 
 @dataclass
 class ChomskyHierarchyTaskConfig(FairseqDataclass):
+    data: str = field(default=".")
     task_name: CHOMSKY_SUBTASK_CHOICES = field(  # type: ignore
         default="parity_check",
         metadata={
@@ -91,15 +81,7 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
     seed: int = II("common.seed")
     batch_size: int = II("dataset.batch_size")
     epoch_size: int =  field(
-        default=100_000,
-        metadata={
-            "help": (
-                "Total number of sequences in training epoch"
-            )
-        },
-    )
-    epoch_size: int =  field(
-        default=100_000,
+        default=10_000,
         metadata={
             "help": (
                 "Total number of sequences in training epoch"
@@ -107,7 +89,7 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
         },
     )
     test_size: int =  field(
-        default=5_000,
+        default=2,
         metadata={
             "help": (
                 "Total number of sequences in test set"
@@ -123,7 +105,7 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
         },
     )
     allow_loss_on_problem_statement: bool =  field(
-        default=True,
+        default=False,
         metadata={
             "help": (
                 "Only include problem solution in cross-entropy loss (discard loss on input part)"
@@ -137,6 +119,110 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
         if self.batch_size ==  II("data.batch_size"):
             self.batch_size = 128
 
+
+class ChomskyIndexedDataset(FairseqDataset):
+    def __init__(self, cfg: ChomskyHierarchyTaskConfig, dictionary, *, src_path, tgt_path):
+        super().__init__()
+        self.cfg = cfg
+        self.dictionary = dictionary
+        self.task_name = str(self.cfg.task_name)
+        self.seed = self.cfg.seed
+        self.src_dataset = data_utils.load_indexed_dataset(
+            str(src_path), self.dictionary, "mmap", combine=False,
+        )
+        self.tgt_dataset = data_utils.load_indexed_dataset(
+            str(tgt_path), self.dictionary, "mmap", combine=False,
+        )
+        # we make this a sequence so we can put it directly into torch.cat
+        self.separator_seq = torch.tensor([self.dictionary.bos()]).long()
+        self.eos_seq = torch.tensor([self.dictionary.bos()]).long()
+        self.eos_idx = self.dictionary.eos()
+        assert self.src_dataset is not None, f"Expected to find dataset at {src_path}"
+        assert self.tgt_dataset is not None, f"Expected to find dataset at {tgt_path}"
+
+    def __getitem__(self, index):
+        src_tokens = self.src_dataset[index]
+        # tgt may or may not have eos already
+        target = self.tgt_dataset[index]
+        # strip eos if it is there (to ensure uniformity)
+        if target[-1] == self.eos_idx:
+            target = target[:-1]
+        separator = torch.tensor([self.dictionary.bos()]).long()
+        eos = torch.tensor([self.dictionary.eos()]).long()
+
+        output = {
+            "target": torch.cat([
+                src_tokens, 
+                self.separator_seq, 
+                target, 
+                self.eos_seq
+            ]),
+            "id": index,
+        }
+        # move eos so that it is in front, for teacher forcing
+        output["src_tokens"] = output["target"].roll(1)
+
+        if self.cfg.allow_loss_on_problem_statement:
+            output["loss_keep_mask"] = torch.ones_like(output["target"])
+        else:
+            output["loss_keep_mask"] = torch.cat([
+                torch.zeros_like(src_tokens), 
+                torch.zeros_like(self.separator_seq), 
+                torch.ones_like(target), 
+                torch.ones_like(self.eos_seq), 
+            ])
+        return output
+
+    def __len__(self):
+        return len(self.src_dataset)
+
+    def size(self, index):
+        return self.src_dataset.sizes[index]
+
+    def num_tokens_vec(self, indices):
+        """Return the number of tokens for a set of positions defined by indices.
+        This value is used to enforce ``--max-tokens`` during batching."""
+        return self.src_dataset.sizes[indices]
+
+    def collater(self, samples):
+        """Merge a list of samples to form a mini-batch.
+        Args:
+            samples (List[dict]): samples to collate
+        Returns:
+            dict: a mini-batch with the following keys:
+                - `id` (LongTensor): example IDs in the original input order
+                - `ntokens` (int): total number of tokens in the batch
+                - `net_input` (dict): the input to the Model, containing keys:
+                  - `src_tokens` (LongTensor): a padded 2D Tensor of tokens in
+                    the source sentence of shape `(bsz, src_len)`. Padding will
+                    appear on the right.
+                - `target` (LongTensor): a padded 2D Tensor of tokens in the
+                  target sentence of shape `(bsz, tgt_len)`. Padding will appear
+                  on the right.
+        """
+        all_keys = list(samples[0].keys())
+        collated = {}
+        if "src_tokens" in all_keys:
+            collated["src_tokens"] = collate_tokens([s["src_tokens"] for s in samples], pad_idx=self.dictionary.pad())
+        collated["id"] = torch.LongTensor([s["id"] for s in samples])
+        collated["target"] = collate_tokens([s["target"] for s in samples], pad_idx=self.dictionary.pad())
+        if "prev_output_tokens" in all_keys:
+            collated["prev_output_tokens"] = collate_tokens([s["prev_output_tokens"] for s in samples], pad_idx=self.dictionary.pad())
+        collated["loss_keep_mask"] = collate_tokens([s["loss_keep_mask"] for s in samples], pad_idx=0)
+        net_input_keys = ("src_tokens", "prev_output_tokens")
+        res = {
+            key: collated[key]
+            for key in all_keys if key not in net_input_keys
+        }
+        res["net_input"] = {
+            key: collated[key]
+            for key in  net_input_keys
+            if key in all_keys
+        }
+        ntokens_key = "src_tokens" if "src_tokens" in all_keys else "prev_output_tokens"
+        res["ntokens"] = sum(len(s[ntokens_key]) for s in samples) 
+        res["nsentences"] = len(samples)
+        return res
 
 
 class ChomskyDataset(FairseqDataset):
@@ -157,21 +243,35 @@ class ChomskyDataset(FairseqDataset):
             task_kwargs["modulus"] = self.cfg.modulus
         if self.task_name in ("reverse_string", "duplicate_string", "odds_first"):
             task_kwargs["vocab_size"] = self.cfg.vocab_size
-        self._jax_chomsky_task = constants.TASK_BUILDERS[self.task_name](**task_kwargs)
+
+        if task_name == "modular_arithmetic":
+            self._jax_chomsky_task = constants.TASK_BUILDERS[self.task_name](**task_kwargs)
+        else:
+            self._jax_chomsky_task = constants.TASK_BUILDERS[self.task_name](modulus=self.cfg.modulus, operators=('+', '*', '-'))
         self.length_range = self.cfg.length_training_range
         if not self.is_training:
             self.length_range = self.cfg.length_eval_range
         self.set_epoch(1)
+        self.items = []
+        # items = [self[index] for index in range(self._length)]
+        # self.items = items
+        # del self._jax_chomsky_task
+
 
     def __getitem__(self, index):
+        if self.items:
+            return self.items[index]
         """
         XXX: we could either sample one just in time
 
         or we could build all of them ahead of time (like 100k or something)
         """
-        rng_seq = hk.PRNGSequence(hash((self.seed, self.epoch, index)))
         item_length = self._sizes[index]
-        item = self._jax_chomsky_task.sample_batch(next(rng_seq), length=item_length, batch_size=1)
+        rng_seq = hk.PRNGSequence(hash((self.seed, self.epoch, index)))
+        if self.task_name == "modular_arithmetic":
+            item = self._jax_chomsky_task.sample_batch(next(rng_seq), sequence_length=item_length, batch_size=1)
+        else:
+            item = self._jax_chomsky_task.sample_batch(next(rng_seq), length=item_length, batch_size=1)
         del rng_seq 
         assert sorted(list(item.keys())) == ["input", "output"]
         # make jax/haiku tensor compatible with numpy then transform one-hot into index
@@ -192,7 +292,6 @@ class ChomskyDataset(FairseqDataset):
         tgt_stringified = " ".join(str(i) for i in tgt_idxs)
 
         if self.cfg.use_encoder_decoder_format:
-            # self.cfg.allow_loss_on_problem_statement does not matter since source only goes to encoder
             fairseq_item = {
                 "id": index,
                 "src_tokens": self.dictionary.encode_line(src_stringified, add_if_not_exist=False, append_eos=True).long(),
@@ -216,7 +315,6 @@ class ChomskyDataset(FairseqDataset):
             "id": index,
         }
         fairseq_item["src_tokens"] = fairseq_item["target"].roll(1)
-        # fairseq_item["prev_output_tokens"] = fairseq_item["src_tokens"]
         if self.cfg.allow_loss_on_problem_statement:
             fairseq_item["loss_keep_mask"] = torch.cat([
                 torch.zeros_like(source), 
@@ -301,6 +399,8 @@ class ChomskyHierarchyTask(FairseqTask):
         self._source_dictionary = dictionary
         self._target_dictionary = dictionary
         self.cfg = cfg
+        # from jax.config import config
+        # config.update('jax_disable_jit', True)
 
     @property
     def source_dictionary(self):
@@ -308,7 +408,11 @@ class ChomskyHierarchyTask(FairseqTask):
 
     @property
     def target_dictionary(self):
-        return self._target_dictionary
+        return self._source_dictionary
+
+    @property
+    def dictionary(self):
+        return self._source_dictionary
 
     @classmethod
     def setup_task(cls, cfg: DictConfig, **kwargs):
@@ -318,20 +422,43 @@ class ChomskyHierarchyTask(FairseqTask):
             cfg (omegaconf.DictConfig): parsed command-line arguments
         """
         # make source dictionary
-        symbols = "0123456789abcdefghijklmnopqrstuvwxyz"
+        numbers = [str(i) for i in range(10)]
+        letters = list("abcdefghijklmnopqrstuvwxyz")
+        symbols =  numbers + letters
         assert 2 <= cfg.vocab_size < len(symbols)
         dictionary = Dictionary()
-        for symbol in symbols[:cfg.vocab_size]:
+        # for symbol in symbols[:cfg.vocab_size]:
+        for symbol in symbols:
             dictionary.add_symbol(symbol)
         return cls(cfg, dictionary, **kwargs)
 
     def load_dataset(
         self, split: str, epoch=1, combine=False, **kwargs
     ) -> ChomskyDataset:
-        is_training = "train" in split
-        self.datasets[split] = ChomskyDataset(self.cfg, self.source_dictionary, is_training=is_training)
+        data_dir = Path(self.cfg.data)
+        assert data_dir.is_dir()
+        src_fname = f"{split}.{self.cfg.task_name}.src"
+        tgt_fname = f"{split}.{self.cfg.task_name}.tgt"
+        self.datasets[split] = ChomskyIndexedDataset(
+            self.cfg,
+            self.dictionary,
+            src_path=data_dir / src_fname,
+            tgt_path=data_dir / tgt_fname,
+        )
         return self.datasets[split]
 
+    def valid_step(self, sample, model, criterion):
+        model.eval()
+        with torch.no_grad():
+            loss, sample_size, logging_output = criterion(model, sample)
+        return loss, sample_size, logging_output
+
+    def begin_valid_epoch(self, epoch, model):
+        """Hook function called before the start of each validation epoch."""
+        # del self.datasets["train"]
+        # breakpoint()
+        # print()
+        pass
 
 #   @abc.abstractmethod
 #   def sample_batch(self, rng: chex.PRNGKey, batch_size: int,

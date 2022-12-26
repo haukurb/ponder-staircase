@@ -32,7 +32,7 @@ task:
   task_name: "parity_check"
 
 dataset:
-  max_tokens: 512
+  max_tokens: 541
   skip_invalid_size_inputs_valid_test: true
   required_batch_size_multiple: 1
   validate_interval: 10000000
@@ -46,8 +46,8 @@ optimizer:
   _name: adam
 
 optimization:
-  max_epoch: 10
-  max_update: 100
+    #max_epoch: 10
+  max_update: 2
   update_freq:
     - 1
   lr:
