@@ -31,19 +31,36 @@ which has the following license:
 from collections import deque
 from dataclasses import dataclass, field
 from itertools import cycle, islice
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from fairseq.distributed import fsdp_wrap
 from fairseq.models import register_model, register_model_architecture
 from fairseq.models.transformer import TransformerConfig
 from fairseq.models.transformer.transformer_decoder import TransformerDecoderBase
+from fairseq.modules import MultiheadAttention
 from fairseq.models.transformer_lm import TransformerLanguageModel
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.transformer_layer import TransformerDecoderLayerBase
+from fairseq.dataclass import ChoiceEnum
 from fairseq.utils import safe_getattr
 from icecream import ic
 from torch import Tensor
+from . import multihead_rotary_attention
+
+"""
+Our alternatives for (length extrapolatable) rotary encodings are:
+https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py
+https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
+https://github.com/sunyt32/torchscale/blob/main/torchscale/component/multihead_attention.py
+https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/layers/rotary.py
+"""
+POSITION_ENCODING_CHOICES = ChoiceEnum(
+    [
+        "xpos",
+        "rope",
+    ]
+)
 
 
 @dataclass
@@ -62,6 +79,9 @@ class StaircaseTransformerConfig(TransformerConfig):
     num_staircase_layers: int = field(default=4)
     num_top_layers: int = field(default=1)
     use_alibi: bool = field(default=False)
+    position_encoding: POSITION_ENCODING_CHOICES = field(  # type: ignore
+        default="xpos",
+    )
 
     def __post_init__(self):
         self.decoder.layers = (
@@ -236,20 +256,24 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             0 1 2 3 7 8 9 10 11..
                     ^--- 4,5,6 were skipped
 
+        """
+
+        # # embed positions
+        # positions = None
+        # if self.embed_positions is not None:
+        #     positions = self.embed_positions(
+        #         prev_output_tokens, incremental_state=incremental_state
+        #     )
+
+        # if incremental_state is not None:
+        #     prev_output_tokens = prev_output_tokens[:, -1:]
+        #     if positions is not None:
+        #         positions = positions[:, -1:]
+
+        """
         end modification of original function
         """
 
-        # embed positions
-        positions = None
-        if self.embed_positions is not None:
-            positions = self.embed_positions(
-                prev_output_tokens, incremental_state=incremental_state
-            )
-
-        if incremental_state is not None:
-            prev_output_tokens = prev_output_tokens[:, -1:]
-            if positions is not None:
-                positions = positions[:, -1:]
 
         # Prevent torchscript exporting issue for dynamic quant embedding
         prev_output_tokens = prev_output_tokens.contiguous()
@@ -262,8 +286,8 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         if self.project_in_dim is not None:
             x = self.project_in_dim(x)
 
-        if positions is not None:
-            x += positions
+        # if positions is not None:
+        #     x += positions
 
         if self.layernorm_embedding is not None:
             x = self.layernorm_embedding(x)
@@ -302,104 +326,107 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             )
             inner_states.append(x)
 
-        _, _, edim = x.shape
+        if  self.staircase_layers:
+            _, _, edim = x.shape
 
-        # we need to make sure that attention for incremental_state behaves the same way as staircase attention
-        assert incremental_state is None, "Not implemented yet"
-        _x_before_staircase = x
-        # used a fixed chunk size as scaffolding for now
-        fixed_chunk_len = 4
-        # x is of shape [SeqLen, Batch, NumHidden]
-        chunks = x.split(fixed_chunk_len, dim=0)
-        chunk_lens = [chunk.shape[0] for chunk in chunks]
+            # we need to make sure that attention for incremental_state behaves the same way as staircase attention
+            assert incremental_state is None, "Not implemented yet"
+            _x_before_staircase = x
+            # used a fixed chunk size as scaffolding for now
+            fixed_chunk_len = 4
+            # x is of shape [SeqLen, Batch, NumHidden]
+            chunks = x.split(fixed_chunk_len, dim=0)
+            chunk_lens = [chunk.shape[0] for chunk in chunks]
 
-        cache = StaircaseCache()
+            cache = StaircaseCache()
 
-        # queue chunked input so that we only input one chunk a at a time
-        chunk_queue = deque(chunks)
-        total_staircase_forwards = len(chunks) + len(self.staircase_layers) - 1
+            # queue chunked input so that we only input one chunk a at a time
+            chunk_queue = deque(chunks)
+            total_staircase_forwards = len(chunks) + len(self.staircase_layers) - 1
 
-        # TODO: only roll staircase while training
-        staircase_start = torch.randint(0, len(self.staircase_layers), size=[1])[0]
-        rolled_staircase = (
-            self.staircase_layers[staircase_start:]
-            + self.staircase_layers[:staircase_start]
-        )
-
-        # track the number of forwards for each chunk so we know when they are finalized
-        nforwards_per_chunk = torch.zeros(len(chunks), dtype=torch.long)
-        x = x.new_zeros(0, bsz, edim)  # here x is equivalent to 'prev_layer_output'
-        nchunks_in_staircase = (
-            0  # number of chunks removed from the queue and put into the staircase
-        )
-        ncached_chunks = (
-            0  # number of chunks removed from staircase after they are finalized
-        )
-        for _forward_count, layer in enumerate(
-            islice(cycle(rolled_staircase), total_staircase_forwards), start=1
-        ):
-            if chunk_queue:
-                next_chunk = chunk_queue.popleft()
-                x = torch.cat([x, next_chunk], dim=0)
-                nchunks_in_staircase += 1
-
-            if incremental_state is None and not full_context_alignment:
-                self_attn_mask = self.buffered_future_mask(x)
-            else:
-                self_attn_mask = None
-
-            # XXX TODO: self_attn_mask will not work during inference (we don't properly handle incremental_state)
-            assert incremental_state is None
-            nqueries = x.shape[0]
-            curr_self_attn_mask = self_attn_mask
-            if cache.num_vecs > 0:
-                assert isinstance(self_attn_mask, torch.FloatTensor)
-                # mask is additive, not multiplicative
-                curr_self_attn_mask = torch.cat([self_attn_mask.new_zeros(nqueries, cache.num_vecs), self_attn_mask], dim=1)
-
-            # self_attn_padding_mask: [Batch, KeySeqLen]
-            curr_self_attn_padding_mask = self_attn_padding_mask
-            if self_attn_padding_mask is not None:
-                curr_self_attn_padding_mask = self_attn_padding_mask[:, :cache.num_vecs + nqueries]
-
-            x, layer_attn, _ = layer(
-                x,
-                None,  # enc_out
-                None,  # encoder_padding_mask
-                incremental_state,
-                self_attn_mask=curr_self_attn_mask,
-                self_attn_padding_mask=curr_self_attn_padding_mask,
-                need_attn=False,
-                need_head_weights=False,
-                key_cache=cache,
+            # TODO: only roll staircase while training
+            staircase_start = torch.randint(0, len(self.staircase_layers), size=[1])[0]
+            rolled_staircase = (
+                self.staircase_layers[staircase_start:]
+                + self.staircase_layers[:staircase_start]
             )
-            # XXX: if we skip a layer due to layerdrop, we still want to count it in staircase_nforwards,
-            #      that means we cannot use layerdropmodule from fairseq to implement our layerdrop
 
-            # after a chunk as been forwarded num_staircase_layers many times it becomes a key_only chunk
-            # we find the first chunk where it hasnt been forwarded that many times
-            nforwards_per_chunk[ncached_chunks:nchunks_in_staircase] += 1
-            if nforwards_per_chunk.ge(len(self.staircase_layers)).any():
-                # check if any chunk as been forwarded enough times to leave the staircase
-                nchunks_finished_this_forward = (
-                    nforwards_per_chunk[ncached_chunks:]
-                    .ge(len(self.staircase_layers))
-                    .sum()
-                )
-                # cache all the vectors from those chunks (can be mnore than one chunk)
-                nvecs_to_be_cached = sum(
-                    chunk_lens[
-                        ncached_chunks : ncached_chunks + nchunks_finished_this_forward
-                    ]
-                )
-                # partition x into next inputs and cached inputs
-                cache.finalized_chunks.append(x[:nvecs_to_be_cached])
-                x = x[nvecs_to_be_cached:]
-                # keep track of all chunks forwarded
-                ncached_chunks += nchunks_finished_this_forward
+            # track the number of forwards for each chunk so we know when they are finalized
+            nforwards_per_chunk = torch.zeros(len(chunks), dtype=torch.long)
+            x = x.new_zeros(0, bsz, edim)  # here x is equivalent to 'prev_layer_output'
+            nchunks_in_staircase = (
+                0  # number of chunks removed from the queue and put into the staircase
+            )
+            ncached_chunks = (
+                0  # number of chunks removed from staircase after they are finalized
+            )
+            for _forward_count, layer in enumerate(
+                islice(cycle(rolled_staircase), total_staircase_forwards), start=1
+            ):
+                if chunk_queue:
+                    next_chunk = chunk_queue.popleft()
+                    x = torch.cat([x, next_chunk], dim=0)
+                    nchunks_in_staircase += 1
 
-        assert x.shape[0] == 0, "All have been moved to the cache at this point"
-        x = torch.cat(cache.finalized_chunks, dim=0)
+                if incremental_state is None and not full_context_alignment:
+                    self_attn_mask = self.buffered_future_mask(x)
+                else:
+                    self_attn_mask = None
+
+                assert self_attn_mask is not None
+                # XXX TODO: self_attn_mask will not work during inference (we don't properly handle incremental_state)
+                assert incremental_state is None
+                nqueries = x.shape[0]
+                curr_self_attn_mask = self_attn_mask
+                if cache.num_vecs > 0:
+                    assert self_attn_mask.dtype in (torch.float16, torch.float32, torch.float64)
+                    # assert isinstance(self_attn_mask, torch.FloatTensor) or isinstance(self_attn_mask, torch.FloatTensor)
+                    # mask is additive, not multiplicative
+                    curr_self_attn_mask = torch.cat([self_attn_mask.new_zeros(nqueries, cache.num_vecs), self_attn_mask], dim=1)
+
+                # self_attn_padding_mask: [Batch, KeySeqLen]
+                curr_self_attn_padding_mask = self_attn_padding_mask
+                if self_attn_padding_mask is not None:
+                    curr_self_attn_padding_mask = self_attn_padding_mask[:, :cache.num_vecs + nqueries]
+
+                x, layer_attn, _ = layer(
+                    x,
+                    None,  # enc_out
+                    None,  # encoder_padding_mask
+                    incremental_state,
+                    self_attn_mask=curr_self_attn_mask,
+                    self_attn_padding_mask=curr_self_attn_padding_mask,
+                    need_attn=False,
+                    need_head_weights=False,
+                    key_cache=cache,
+                )
+                # XXX: if we skip a layer due to layerdrop, we still want to count it in staircase_nforwards,
+                #      that means we cannot use layerdropmodule from fairseq to implement our layerdrop
+
+                # after a chunk as been forwarded num_staircase_layers many times it becomes a key_only chunk
+                # we find the first chunk where it hasnt been forwarded that many times
+                nforwards_per_chunk[ncached_chunks:nchunks_in_staircase] += 1
+                if nforwards_per_chunk.ge(len(self.staircase_layers)).any():
+                    # check if any chunk as been forwarded enough times to leave the staircase
+                    nchunks_finished_this_forward = (
+                        nforwards_per_chunk[ncached_chunks:]
+                        .ge(len(self.staircase_layers))
+                        .sum()
+                    )
+                    # cache all the vectors from those chunks (can be mnore than one chunk)
+                    nvecs_to_be_cached = sum(
+                        chunk_lens[
+                            ncached_chunks : ncached_chunks + nchunks_finished_this_forward
+                        ]
+                    )
+                    # partition x into next inputs and cached inputs
+                    cache.finalized_chunks.append(x[:nvecs_to_be_cached])
+                    x = x[nvecs_to_be_cached:]
+                    # keep track of all chunks forwarded
+                    ncached_chunks += nchunks_finished_this_forward
+
+            assert x.shape[0] == 0, "All have been moved to the cache at this point"
+            x = torch.cat(cache.finalized_chunks, dim=0)
 
         for idx, layer in enumerate(self.top_layers):
             if incremental_state is None and not full_context_alignment:
@@ -483,11 +510,19 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
             assert incremental_state is not None
             self.self_attn._set_input_buffer(incremental_state, saved_state)
         _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
-        # modification of original function
+
+        """
+        begin modification of original function
+        """
+
         assert (
             not self.cross_self_attention
         ), "self.cross_self_attention does not behave correctly for rotary embeddings"
-        # end modification
+
+        """
+        end modification
+        """
+
         if self.cross_self_attention and not (
             incremental_state is not None
             and _self_attn_input_buffer is not None
@@ -519,7 +554,6 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
             x_with_cache = x
         else:
             x_with_cache = torch.cat(key_cache.finalized_chunks + [x], dim=0)
-        # XXX TODO: add attn_mask and key_padding_mask back in
         x, attn = self.self_attn(
             query=x,
             key=x_with_cache,
@@ -604,6 +638,25 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
                 self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
             return x, attn, self_attn_state
         return x, attn, None
+
+    def build_self_attention(
+        self, embed_dim, cfg, add_bias_kv=False, add_zero_attn=False
+    ):
+        return multihead_rotary_attention.MultiheadRotaryAttention(
+        # return MultiheadAttention(
+            embed_dim,
+            cfg.decoder.attention_heads,
+            dropout=cfg.attention_dropout,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=add_zero_attn,
+            # when true this ignores the k and v vectors and uses q instead
+            self_attention=False,
+            q_noise=self.quant_noise,
+            qn_block_size=self.quant_noise_block_size,
+            xformers_att_config=cfg.decoder.xformers_att_config,
+            # our addition
+            use_xpos=cfg.position_encoding == "xpos",
+        )
 
 
 class TransformerAlibiDecoderLayerBase(TransformerDecoderLayerBase):

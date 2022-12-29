@@ -79,7 +79,7 @@ def generate_batch(*, jax_task, jax_rng_seq, length, batch_size, task_name):
 def generate_subset(*, src_path, tgt_path, subset_name, jax_task, min_len, max_len, num_batches, batch_size, seed, task_name):
     jax_rng_seq = hk.PRNGSequence(hash((seed, subset_name)) % (2**32 - 1))
     np.random.seed(hash((seed, subset_name)) % (2**32 - 1))
-    batch_lengths = np.random.randint(min_len, max_len, size=[num_batches]).tolist()
+    batch_lengths = np.random.randint(min_len, max_len + 1, size=[num_batches]).tolist()
 
     with open(src_path, "w") as src_fh,\
             open(tgt_path, "w") as tgt_fh:
@@ -120,10 +120,10 @@ def main(
         subset_name="train",
         jax_task=jax_task, 
         min_len=1,
-        max_len=train_length_range,
+        max_len=train_length_range // 5,
         seed=seed,
         num_batches=train_steps, 
-        batch_size=batch_size,
+        batch_size=batch_size * 5,
         task_name=task_name,
     )
 
@@ -132,7 +132,7 @@ def main(
         tgt_path=data_dir / f"valid.{task_name}.tgt", 
         subset_name="valid",
         jax_task=jax_task, 
-        min_len=train_length_range,
+        min_len=train_length_range + 2,
         max_len=valid_length_range,
         seed=seed,
         num_batches=valid_size // 2, 
@@ -145,7 +145,7 @@ def main(
         tgt_path=data_dir / f"test.{task_name}.tgt", 
         subset_name="test",
         jax_task=jax_task, 
-        min_len=train_length_range,
+        min_len=train_length_range + 2,
         max_len=test_length_range,
         seed=seed,
         num_batches=test_size // 2, 

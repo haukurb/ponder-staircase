@@ -1,23 +1,24 @@
 # @package _group_
 
-_name: lm_debug
+_name: top_level.debug.staircase.lm
 
 criterion:
-  _name: cross_entropy
+  _name: cross_entropy_with_ponder
 
 common:
-  _name: lm_debug
+  _name: common.debug.staircase.lm
   no_progress_bar: true
-  log_interval: 1
+  log_interval: 100
   seed: 1
-  cpu: true
-  fp16: false
+  fp16: true
+  # cpu: true
 
+# this setup achieves ~28 ups with this on A100 half precision
 model:
   _name: staircase_lm
   num_bottom_layers: 2
   num_staircase_layers: 2
-  num_top_layers: 0
+  num_top_layers: 1
   share_decoder_input_output_embed: true
   decoder:
       input_dim: 64
@@ -25,6 +26,7 @@ model:
       embed_dim: 64
       ffn_embed_dim: 256
       attention_heads: 8
+      xformers_att_config: '{"name":"scaled_dot_product"}'
 
 
 task:
@@ -32,41 +34,37 @@ task:
   task_name: "parity_check"
 
 dataset:
-  max_tokens: 541
   skip_invalid_size_inputs_valid_test: true
   required_batch_size_multiple: 1
-  validate_interval: 10000000
+  validate_interval: 5_000
   fixed_validation_seed: 1
-  batch_size: 32
+  batch_size: 128
   num_workers: 0
-  #train_subset: example
-  # valid_subset: ???
 
 optimizer:
   _name: adam
 
 optimization:
-    #max_epoch: 10
-  max_update: 2
+  max_update: 100_000
   update_freq:
     - 1
   lr:
-    - 5e-4
+    - 3e-4
+    # paper used {1,3,5}"e-4"
 
 lr_scheduler:
   _name: polynomial_decay
   warmup_updates: 1
 
 checkpoint:
-  save_interval_updates: 100
-  keep_interval_updates: 200
-  keep_interval_updates_pattern: -1
+  save_interval_updates: 10_000
+  keep_interval_updates_pattern: 5
   keep_last_epochs: 0
   keep_best_checkpoints: -1
-  no_save: true
+  no_save: false
   no_epoch_checkpoints: false
   no_last_checkpoints: false
 
 hydra:
   job:
-    name: dummy_lm
+    name: hydra.debug.staircase.lm

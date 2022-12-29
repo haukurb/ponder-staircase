@@ -15,6 +15,7 @@ for TASK_NAME in parity_check even_pairs cycle_navigation \
 
     echo "Generating $TASK_NAME"
 
+    # this can take up to an hour per task when train_steps=1_000_000
     python $1/prepare_chomsky.py \
         --base-dir=$PROJECT_DIR \
         --data-dirname=data \
@@ -26,9 +27,9 @@ for TASK_NAME in parity_check even_pairs cycle_navigation \
         --valid-length-range=140 \
         --seed=1 \
         --batch-size=128 \
-        --train-steps=100000 \
-        --valid-size=2000 \
-        --test-size=2000
+        --train-steps=1000000 \
+        --valid-size=5000 \
+        --test-size=5000
 
     rm -f $DATA_DIR/tmp/dict.{src,tgt}.txt
     fairseq-preprocess \
@@ -50,4 +51,5 @@ for TASK_NAME in parity_check even_pairs cycle_navigation \
             done
         done
     done
+
 done

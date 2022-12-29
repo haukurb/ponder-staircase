@@ -19,6 +19,7 @@ conda activate ponder
 # conda install pytorch torchvision torchaudio cudatoolkit=11.3.1 -c pytorch -c nvidia
 pip install matplotlib tqdm
 pip install tensorboard
+pip install rotary-embedding-torch
 
 # pushd transformer-sequential
 # pip install -r requirements.txt
@@ -27,8 +28,14 @@ pip install tensorboard
 # mkdir -p staircase
 
 git clone https://github.com/haukurb/ponder-staircase
+pushd ponder-staircase
+
 git clone https://github.com/deepmind/neural_networks_chomsky_hierarchy
 pushd neural_networks_chomsky_hierarchy
 pip install -r requirements.txt
 popd
 
+git clone https://github.com/sunyt32/torchscale
+pushd torchscale
+pip install -e .
+popd
