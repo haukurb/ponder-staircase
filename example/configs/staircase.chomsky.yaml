@@ -20,6 +20,7 @@ model:
   num_staircase_layers: 2
   num_top_layers: 1
   share_decoder_input_output_embed: true
+  position_encoding: xpos
   decoder:
       input_dim: 64
       output_dim: ${model.decoder.embed_dim}
@@ -36,10 +37,10 @@ task:
 dataset:
   skip_invalid_size_inputs_valid_test: true
   required_batch_size_multiple: 1
-  validate_interval: 5_000
+  validate_interval: 2_500
   fixed_validation_seed: 1
   batch_size: 128
-  num_workers: 0
+  num_workers: 2
 
 optimizer:
   _name: adam
@@ -57,13 +58,19 @@ lr_scheduler:
   warmup_updates: 1
 
 checkpoint:
-  save_interval_updates: 10_000
-  keep_interval_updates_pattern: 5
+  save_interval_updates: 2_500
+  # keep_interval_updates_pattern: 5
+  keep_interval_updates: 2
   keep_last_epochs: 0
   keep_best_checkpoints: -1
   no_save: false
   no_epoch_checkpoints: false
   no_last_checkpoints: false
+  save_dir: checkpoints
+  # reset_dataloader: true
+  # reset_optimizer: true
+  # reset_lr_scheduler: true
+  # reset_meters: true
 
 hydra:
   job:

@@ -27,6 +27,7 @@ which has the following license:
 """
 
 from typing import Optional, Tuple
+import logging
 
 import torch
 from torch import Tensor
@@ -39,6 +40,8 @@ from xformers.components.attention.utils import maybe_merge_masks
 from icecream import ic
 
 from . import torchscale_xpos_relative_position
+
+logger = logging.getLogger(__file__)
 
 # @with_incremental_state
 class MultiheadRotaryAttention(MultiheadAttention):
@@ -64,7 +67,7 @@ class MultiheadRotaryAttention(MultiheadAttention):
         xformers_blocksparse_blocksize: Optional[
             int
         ] = 16,
-        use_xpos=True,
+        position_encoding="xpos",
     ):
         super().__init__(
             embed_dim,
@@ -85,7 +88,14 @@ class MultiheadRotaryAttention(MultiheadAttention):
         )
         assert kdim is None
         assert vdim is None
-        self.xpos = torchscale_xpos_relative_position.XPos(head_dim=embed_dim, use_scaling=use_xpos)
+        self.rotary_embedding = None
+        if position_encoding in ("xpos", "rope"):
+            use_scaling = position_encoding=="xpos"
+            logger.info(f"Using rotary position encoding with use_scaling={use_scaling}")
+            self.rotary_embedding = torchscale_xpos_relative_position.XPos(head_dim=embed_dim, use_scaling=position_encoding=="xpos")
+        else:
+            logger.info(f"Using no position embedding")
+            assert position_encoding == "none"
 
     def _xformers_attn_forward(
         self,
@@ -120,12 +130,13 @@ class MultiheadRotaryAttention(MultiheadAttention):
         """
         begin modification of original function
         """
-        q_len = q.shape[0]
-        k_len = k.shape[0]
-        # we shift query vectors so that the last query vector has the same encoded position as the last key vector
-        offset = (k_len - q_len)//2 + 1
-        q = self.xpos.apply(q, offset = offset)
-        k = self.xpos.apply(k, invert_scale=True)
+        if self.rotary_embedding is not None:
+            q_len = q.shape[0]
+            k_len = k.shape[0]
+            # we shift query vectors so that the last query vector has the same encoded position as the last key vector
+            offset = (k_len - q_len)//2 + 1
+            q = self.rotary_embedding.apply(q, offset = offset)
+            k = self.rotary_embedding.apply(k, invert_scale=True)
         """
         end modification
         """

@@ -66,6 +66,12 @@ class XPos(nn.Module):
         return (sin, cos, scale)
 
     def apply(self, x, offset=0, dim=-2, invert_scale=False):
+        """
+        Note: we might want to implement partial rotation (e.g. rotation only half the dimensions of x instead of all)
+        as shown by:
+            https://wandb.ai/eleutherai/neox/reports/Partial-Rotary-Tests-v2--Vmlldzo2MjE4MTQ
+            https://wandb.ai/lucidrains/x-transformers-experiments/reports/partial-rotary--Vmlldzo2MjAyODY?accessToken=f657029yibaln2vseli6egxxwykhpeuedeuvcnmmdgn4i6d5b1r30it3mp0gw0k5
+        """
         bsz, seqlen, _ = x.shape
         sin, cos, scale = self.forward(seqlen)
         # [SeqLen, NumDims/2] -> [1, SeqLen, NumDims]

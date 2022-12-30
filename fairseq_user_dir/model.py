@@ -59,6 +59,7 @@ POSITION_ENCODING_CHOICES = ChoiceEnum(
     [
         "xpos",
         "rope",
+        "none",
     ]
 )
 
@@ -132,7 +133,7 @@ class StaircaseTransformerDecoderModel(TransformerLanguageModel):
             cfg, task.source_dictionary, cfg.decoder.embed_dim
         )
 
-        # cfg = StaircaseTransformerConfig.from_namespace(args)
+        cfg.decoder.layers = cfg.num_bottom_layers +  cfg.num_staircase_layers + cfg.num_top_layers
         decoder = StaircaseTransformerDecoder(
             cfg,
             task.source_dictionary,
@@ -655,7 +656,7 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
             qn_block_size=self.quant_noise_block_size,
             xformers_att_config=cfg.decoder.xformers_att_config,
             # our addition
-            use_xpos=cfg.position_encoding == "xpos",
+            position_encoding=cfg.position_encoding,
         )
 
 

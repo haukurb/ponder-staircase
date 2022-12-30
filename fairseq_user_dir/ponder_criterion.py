@@ -53,15 +53,14 @@ class CrossEntropyWithPonderCriterion(FairseqCriterion):
         ntargets_per_seq = loss_keep_mask.sum(dim=-1)
         assert len(ntargets_per_seq.shape) == 1
         targets_per_seq = target.masked_select(loss_keep_mask).split(ntargets_per_seq.tolist())
-        pred = net_output[0].argmax(dim=-1).masked_select(loss_keep_mask).split(ntargets_per_seq.tolist())
         pred_per_seq = net_output[0].argmax(dim=-1).masked_select(loss_keep_mask).split(ntargets_per_seq.tolist())
-        ncorrect_force_dec = sum([pred.eq(tgt).all().item() for (pred, tgt) in zip(pred_per_seq, targets_per_seq)])
+        ncorrect = sum([pred.eq(tgt).all().item() for (pred, tgt) in zip(pred_per_seq, targets_per_seq)])
 
         logging_output = {
             "loss": loss.data,
             "ntokens": sample["ntokens"],
             "nsentences": sample["target"].size(0),
-            "ncorrect": ncorrect_force_dec,
+            "ncorrect": ncorrect,
             "sample_size": sample_size,
         }
         return loss, sample_size, logging_output
@@ -70,6 +69,17 @@ class CrossEntropyWithPonderCriterion(FairseqCriterion):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
         lprobs = lprobs.view(-1, lprobs.size(-1))
         target = model.get_targets(sample, net_output).view(-1)
+
+        if "loss_keep_mask" in sample:
+            keep_mask = sample["loss_keep_mask"].view(-1).bool()
+            loss = F.nll_loss(
+                lprobs[keep_mask],
+                target[keep_mask],
+                ignore_index=self.padding_idx,
+                reduction="sum" if reduce else "none",
+            )
+            return loss, loss
+
         loss = F.nll_loss(
             lprobs,
             target,
