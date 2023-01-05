@@ -46,6 +46,9 @@ from fairseq.dataclass import ChoiceEnum
 from fairseq.utils import safe_getattr
 from icecream import ic
 from torch import Tensor
+
+import numpy as np
+
 from . import multihead_rotary_attention
 
 """
@@ -80,6 +83,8 @@ class StaircaseTransformerConfig(TransformerConfig):
     num_staircase_layers: int = field(default=4)
     num_top_layers: int = field(default=1)
     use_alibi: bool = field(default=False)
+    use_fixed_chunking: bool = field(default=False)
+    chunk_length_parameter: int = field(default=4)
     position_encoding: POSITION_ENCODING_CHOICES = field(  # type: ignore
         default="xpos",
     )
@@ -335,8 +340,20 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             _x_before_staircase = x
             # used a fixed chunk size as scaffolding for now
             fixed_chunk_len = 4
+
+            split_param = self.cfg.chunk_length_parameter
+            if not self.cfg.use_fixed_chunking:
+                rng = np.random.default_rng(seed=hash(prev_output_tokens) % 2**31)
+                chunk_lens = rng.poisson(lam=self.cfg.chunk_length_parameter, size=slen)
+                cumulative = np.cumsum(chunk_lens)
+                cutoff = cumulative.searchsorted(slen)
+                last_chunk_len = slen - cumulative[cutoff - 1]
+                chunk_lens = chunk_lens[:cutoff].tolist()
+                chunk_lens.append(last_chunk_len)
+                split_param = chunk_lens
+
             # x is of shape [SeqLen, Batch, NumHidden]
-            chunks = x.split(fixed_chunk_len, dim=0)
+            chunks = x.split(split_param, dim=0)
             chunk_lens = [chunk.shape[0] for chunk in chunks]
 
             cache = StaircaseCache()
