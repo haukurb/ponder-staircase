@@ -73,12 +73,21 @@ def generate_batch(*, jax_task, jax_rng_seq, length, batch_size, task_name):
 
         tgt_idxs = one_hot_targets[seq_idx].nonzero()[-1]
         tgt_stringified = " ".join(str(i) for i in tgt_idxs)
+        if task_name in ("binary_addition", "binary_multiplication", "stack_manipulation"):
+            # we don't need padding at the end since we are using decoder only models
+            # (the encoder models has to use use padding so as not to provide 
+            #  output length hints as encoder inputs)
+            yield src_stringified, tgt_stringified[:tgt_stringified.index("2")]
+            continue
+        # with regards to solve_equation task: the paper describes operation set {+,-,*}
+        # but their code does not use *
         yield src_stringified, tgt_stringified
 
 
 def generate_subset(*, src_path, tgt_path, subset_name, jax_task, min_len, max_len, num_batches, batch_size, seed, task_name):
-    jax_rng_seq = hk.PRNGSequence(hash((seed, subset_name)) % (2**32 - 1))
-    np.random.seed(hash((seed, subset_name)) % (2**32 - 1))
+    effective_seed = hash((seed, subset_name)) % (2**16 - 1)
+    jax_rng_seq = hk.PRNGSequence(effective_seed)
+    np.random.seed(effective_seed)
     batch_lengths = np.random.randint(min_len, max_len + 1, size=[num_batches]).tolist()
 
     with open(src_path, "w") as src_fh,\
@@ -97,14 +106,15 @@ def generate_subset(*, src_path, tgt_path, subset_name, jax_task, min_len, max_l
 @click.option("--modulus", type=click.INT)
 @click.option("--train-length-range", type=click.INT)
 @click.option("--test-length-range", type=click.INT)
-@click.option("--valid-length-range", type=click.INT)
+@click.option("--valid-ranges", type=str, help="comma separated list of length ranges: '101-200,201-300'")
 @click.option("--seed", type=click.INT)
 @click.option("--batch-size", type=click.INT)
 @click.option("--train-steps", type=click.INT)
 @click.option("--test-size", type=click.INT)
 @click.option("--valid-size", type=click.INT)
 def main(
-    base_dir, data_dirname, task_name, vocab_size, modulus, train_length_range, test_length_range, valid_length_range, 
+    base_dir, data_dirname, task_name, vocab_size, modulus, train_length_range, test_length_range, 
+    valid_ranges,
     seed, batch_size, train_steps, test_size, valid_size,
 ):
     ic(base_dir, data_dirname, task_name, vocab_size, modulus, train_length_range, test_length_range, seed, batch_size, train_steps, test_size)
@@ -113,32 +123,6 @@ def main(
 
     write_dict(data_dir / "dict.txt")
     jax_task = build_task(task_name=task_name, modulus=modulus, vocab_size=vocab_size)
-
-    generate_subset(
-        src_path=data_dir / f"train.{task_name}.src", 
-        tgt_path=data_dir / f"train.{task_name}.tgt", 
-        subset_name="train",
-        jax_task=jax_task, 
-        min_len=1,
-        max_len=train_length_range // 5,
-        seed=seed,
-        num_batches=train_steps, 
-        batch_size=batch_size * 5,
-        task_name=task_name,
-    )
-
-    generate_subset(
-        src_path=data_dir / f"valid.{task_name}.src", 
-        tgt_path=data_dir / f"valid.{task_name}.tgt", 
-        subset_name="valid",
-        jax_task=jax_task, 
-        min_len=train_length_range + 2,
-        max_len=valid_length_range,
-        seed=seed,
-        num_batches=valid_size // 2, 
-        batch_size=2,
-        task_name=task_name,
-    )
 
     generate_subset(
         src_path=data_dir / f"test.{task_name}.src", 
@@ -150,6 +134,36 @@ def main(
         seed=seed,
         num_batches=test_size // 2, 
         batch_size=2,
+        task_name=task_name,
+    )
+
+    for valid_range in valid_ranges.split(","):
+        start, end = valid_range.split("-")
+        start, end = int(start), int(end)
+        assert start < end
+        generate_subset(
+            src_path=data_dir / f"valid.{start}-{end}.{task_name}.src", 
+            tgt_path=data_dir / f"valid.{start}-{end}.{task_name}.tgt", 
+            subset_name="valid",
+            jax_task=jax_task, 
+            min_len=start,
+            max_len=end,
+            seed=seed,
+            num_batches=valid_size // 2, 
+            batch_size=2,
+            task_name=task_name,
+        )
+
+    generate_subset(
+        src_path=data_dir / f"train.{task_name}.src", 
+        tgt_path=data_dir / f"train.{task_name}.tgt", 
+        subset_name="train",
+        jax_task=jax_task, 
+        min_len=1,
+        max_len=train_length_range,
+        seed=seed,
+        num_batches=train_steps // 5, 
+        batch_size=batch_size * 5,
         task_name=task_name,
     )
 

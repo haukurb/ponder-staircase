@@ -39,3 +39,12 @@ git clone https://github.com/sunyt32/torchscale
 pushd torchscale
 pip install -e .
 popd
+
+pip install wandb
+# used by rotary attention
+pip install xformers
+
+# to download bookcorpusopen and enwik8
+pip install datasets
+# for AutoTokenizer
+pip install transformers

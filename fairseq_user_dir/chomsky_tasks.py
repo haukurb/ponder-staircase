@@ -80,31 +80,21 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
     )
     seed: int = II("common.seed")
     batch_size: int = II("dataset.batch_size")
-    epoch_size: int =  field(
+    epoch_size: int = field(
         default=10_000,
-        metadata={
-            "help": (
-                "Total number of sequences in training epoch"
-            )
-        },
+        metadata={"help": ("Total number of sequences in training epoch")},
     )
-    test_size: int =  field(
+    test_size: int = field(
         default=2,
-        metadata={
-            "help": (
-                "Total number of sequences in test set"
-            )
-        },
+        metadata={"help": ("Total number of sequences in test set")},
     )
-    use_encoder_decoder_format: bool =  field(
+    use_encoder_decoder_format: bool = field(
         default=False,
         metadata={
-            "help": (
-                "Put input sequence into source instead of prev_output_tokens"
-            )
+            "help": ("Put input sequence into source instead of prev_output_tokens")
         },
     )
-    allow_loss_on_problem_statement: bool =  field(
+    allow_loss_on_problem_statement: bool = field(
         default=False,
         metadata={
             "help": (
@@ -114,31 +104,43 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
     )
 
     def __post_init__(self):
-        if self.seed ==  II("common.seed"):
+        if self.seed == II("common.seed"):
             self.seed = 1
-        if self.batch_size ==  II("data.batch_size"):
+        if self.batch_size == II("data.batch_size"):
             self.batch_size = 128
 
 
 class ChomskyIndexedDataset(FairseqDataset):
-    def __init__(self, cfg: ChomskyHierarchyTaskConfig, dictionary, *, src_path, tgt_path):
+    def __init__(
+        self, cfg: ChomskyHierarchyTaskConfig, dictionary, *, src_path, tgt_path
+    ):
         super().__init__()
         self.cfg = cfg
         self.dictionary = dictionary
         self.task_name = str(self.cfg.task_name)
         self.seed = self.cfg.seed
         self.src_dataset = data_utils.load_indexed_dataset(
-            str(src_path), self.dictionary, "mmap", combine=False,
+            str(src_path),
+            self.dictionary,
+            "mmap",
+            combine=False,
         )
         self.tgt_dataset = data_utils.load_indexed_dataset(
-            str(tgt_path), self.dictionary, "mmap", combine=False,
+            str(tgt_path),
+            self.dictionary,
+            "mmap",
+            combine=False,
         )
         # we make this a sequence so we can put it directly into torch.cat
         self.separator_seq = torch.tensor([self.dictionary.bos()]).long()
         self.eos_seq = torch.tensor([self.dictionary.bos()]).long()
         self.eos_idx = self.dictionary.eos()
-        assert self.src_dataset is not None, f"Expected to find dataset at {src_path}"
-        assert self.tgt_dataset is not None, f"Expected to find dataset at {tgt_path}"
+        assert (
+            self.src_dataset is not None
+        ), f"Expected to find dataset at {src_path}.bin"
+        assert (
+            self.tgt_dataset is not None
+        ), f"Expected to find dataset at {tgt_path}.bin"
 
     def __getitem__(self, index):
         src_tokens = self.src_dataset[index]
@@ -151,12 +153,7 @@ class ChomskyIndexedDataset(FairseqDataset):
         eos = torch.tensor([self.dictionary.eos()]).long()
 
         output = {
-            "target": torch.cat([
-                src_tokens, 
-                self.separator_seq, 
-                target, 
-                self.eos_seq
-            ]),
+            "target": torch.cat([src_tokens, self.separator_seq, target, self.eos_seq]),
             "id": index,
         }
         # move eos so that it is in front, for teacher forcing
@@ -165,12 +162,14 @@ class ChomskyIndexedDataset(FairseqDataset):
         if self.cfg.allow_loss_on_problem_statement:
             output["loss_keep_mask"] = torch.ones_like(output["target"])
         else:
-            output["loss_keep_mask"] = torch.cat([
-                torch.zeros_like(src_tokens), 
-                torch.zeros_like(self.separator_seq), 
-                torch.ones_like(target), 
-                torch.ones_like(self.eos_seq), 
-            ])
+            output["loss_keep_mask"] = torch.cat(
+                [
+                    torch.zeros_like(src_tokens),
+                    torch.zeros_like(self.separator_seq),
+                    torch.ones_like(target),
+                    torch.ones_like(self.eos_seq),
+                ]
+            )
         return output
 
     def __len__(self):
@@ -203,24 +202,28 @@ class ChomskyIndexedDataset(FairseqDataset):
         all_keys = list(samples[0].keys())
         collated = {}
         if "src_tokens" in all_keys:
-            collated["src_tokens"] = collate_tokens([s["src_tokens"] for s in samples], pad_idx=self.dictionary.pad())
+            collated["src_tokens"] = collate_tokens(
+                [s["src_tokens"] for s in samples], pad_idx=self.dictionary.pad()
+            )
         collated["id"] = torch.LongTensor([s["id"] for s in samples])
-        collated["target"] = collate_tokens([s["target"] for s in samples], pad_idx=self.dictionary.pad())
+        collated["target"] = collate_tokens(
+            [s["target"] for s in samples], pad_idx=self.dictionary.pad()
+        )
         if "prev_output_tokens" in all_keys:
-            collated["prev_output_tokens"] = collate_tokens([s["prev_output_tokens"] for s in samples], pad_idx=self.dictionary.pad())
-        collated["loss_keep_mask"] = collate_tokens([s["loss_keep_mask"] for s in samples], pad_idx=0)
+            collated["prev_output_tokens"] = collate_tokens(
+                [s["prev_output_tokens"] for s in samples],
+                pad_idx=self.dictionary.pad(),
+            )
+        collated["loss_keep_mask"] = collate_tokens(
+            [s["loss_keep_mask"] for s in samples], pad_idx=0
+        )
         net_input_keys = ("src_tokens", "prev_output_tokens")
-        res = {
-            key: collated[key]
-            for key in all_keys if key not in net_input_keys
-        }
+        res = {key: collated[key] for key in all_keys if key not in net_input_keys}
         res["net_input"] = {
-            key: collated[key]
-            for key in  net_input_keys
-            if key in all_keys
+            key: collated[key] for key in net_input_keys if key in all_keys
         }
         ntokens_key = "src_tokens" if "src_tokens" in all_keys else "prev_output_tokens"
-        res["ntokens"] = sum(len(s[ntokens_key]) for s in samples) 
+        res["ntokens"] = sum(len(s[ntokens_key]) for s in samples)
         res["nsentences"] = len(samples)
         return res
 
@@ -245,18 +248,18 @@ class ChomskyDataset(FairseqDataset):
             task_kwargs["vocab_size"] = self.cfg.vocab_size
 
         if task_name == "modular_arithmetic":
-            self._jax_chomsky_task = constants.TASK_BUILDERS[self.task_name](**task_kwargs)
+            self._jax_chomsky_task = constants.TASK_BUILDERS[self.task_name](
+                **task_kwargs
+            )
         else:
-            self._jax_chomsky_task = constants.TASK_BUILDERS[self.task_name](modulus=self.cfg.modulus, operators=('+', '*', '-'))
+            self._jax_chomsky_task = constants.TASK_BUILDERS[self.task_name](
+                modulus=self.cfg.modulus, operators=("+", "*", "-")
+            )
         self.length_range = self.cfg.length_training_range
         if not self.is_training:
             self.length_range = self.cfg.length_eval_range
         self.set_epoch(1)
         self.items = []
-        # items = [self[index] for index in range(self._length)]
-        # self.items = items
-        # del self._jax_chomsky_task
-
 
     def __getitem__(self, index):
         if self.items:
@@ -269,10 +272,14 @@ class ChomskyDataset(FairseqDataset):
         item_length = self._sizes[index]
         rng_seq = hk.PRNGSequence(hash((self.seed, self.epoch, index)))
         if self.task_name == "modular_arithmetic":
-            item = self._jax_chomsky_task.sample_batch(next(rng_seq), sequence_length=item_length, batch_size=1)
+            item = self._jax_chomsky_task.sample_batch(
+                next(rng_seq), sequence_length=item_length, batch_size=1
+            )
         else:
-            item = self._jax_chomsky_task.sample_batch(next(rng_seq), length=item_length, batch_size=1)
-        del rng_seq 
+            item = self._jax_chomsky_task.sample_batch(
+                next(rng_seq), length=item_length, batch_size=1
+            )
+        del rng_seq
         assert sorted(list(item.keys())) == ["input", "output"]
         # make jax/haiku tensor compatible with numpy then transform one-hot into index
         #    we index with 0 to get sequence since we have batch_size=1
@@ -294,8 +301,12 @@ class ChomskyDataset(FairseqDataset):
         if self.cfg.use_encoder_decoder_format:
             fairseq_item = {
                 "id": index,
-                "src_tokens": self.dictionary.encode_line(src_stringified, add_if_not_exist=False, append_eos=True).long(),
-                "target": self.dictionary.encode_line(tgt_stringified, add_if_not_exist=False, append_eos=True).long(),
+                "src_tokens": self.dictionary.encode_line(
+                    src_stringified, add_if_not_exist=False, append_eos=True
+                ).long(),
+                "target": self.dictionary.encode_line(
+                    tgt_stringified, add_if_not_exist=False, append_eos=True
+                ).long(),
             }
             fairseq_item["prev_output_tokens"] = fairseq_item["target"].roll(1)
             fairseq_item["loss_keep_mask"] = torch.ones_like(fairseq_item["target"])
@@ -305,9 +316,13 @@ class ChomskyDataset(FairseqDataset):
 
         # XXX: consider adding equivalence classes to input/output tokens (ie '0' transforms into one of "abcd" and '1' into one of "efgh")
         #      to test hypothesis of restricted vocabulary being bad for transformers (ie makes inputs more distinuishable from each other)
-        source = self.dictionary.encode_line(src_stringified, add_if_not_exist=False, append_eos=False).long()
+        source = self.dictionary.encode_line(
+            src_stringified, add_if_not_exist=False, append_eos=False
+        ).long()
         separator = torch.tensor([self.dictionary.bos()]).long()
-        target = self.dictionary.encode_line(tgt_stringified, add_if_not_exist=False, append_eos=False).long()
+        target = self.dictionary.encode_line(
+            tgt_stringified, add_if_not_exist=False, append_eos=False
+        ).long()
         eos = torch.tensor([self.dictionary.eos()]).long()
 
         fairseq_item = {
@@ -316,12 +331,14 @@ class ChomskyDataset(FairseqDataset):
         }
         fairseq_item["src_tokens"] = fairseq_item["target"].roll(1)
         if self.cfg.allow_loss_on_problem_statement:
-            fairseq_item["loss_keep_mask"] = torch.cat([
-                torch.zeros_like(source), 
-                torch.zeros_like(separator), 
-                torch.ones_like(target), 
-                torch.ones_like(eos), 
-            ])
+            fairseq_item["loss_keep_mask"] = torch.cat(
+                [
+                    torch.zeros_like(source),
+                    torch.zeros_like(separator),
+                    torch.ones_like(target),
+                    torch.ones_like(eos),
+                ]
+            )
         else:
             fairseq_item["loss_keep_mask"] = torch.ones_like(fairseq_item["target"])
         return fairseq_item
@@ -336,10 +353,12 @@ class ChomskyDataset(FairseqDataset):
         num_batches_in_epoch = self.cfg.epoch_size // self.batch_size
         with numpy_seed(hash((self.seed, epoch)) % (2**32 - 1)):
             sizes = np.repeat(
-                np.random.randint(1, self.length_range, size=[num_batches_in_epoch + 1]),
-                repeats=self.batch_size
+                np.random.randint(
+                    1, self.length_range, size=[num_batches_in_epoch + 1]
+                ),
+                repeats=self.batch_size,
             )
-        self._sizes = sizes[:self.cfg.epoch_size]
+        self._sizes = sizes[: self.cfg.epoch_size]
 
     def num_tokens_vec(self, indices):
         """Return the number of tokens for a set of positions defined by indices.
@@ -370,24 +389,28 @@ class ChomskyDataset(FairseqDataset):
         all_keys = list(samples[0].keys())
         collated = {}
         if "src_tokens" in all_keys:
-            collated["src_tokens"] = collate_tokens([s["src_tokens"] for s in samples], pad_idx=self.dictionary.pad())
+            collated["src_tokens"] = collate_tokens(
+                [s["src_tokens"] for s in samples], pad_idx=self.dictionary.pad()
+            )
         collated["id"] = torch.LongTensor([s["id"] for s in samples])
-        collated["target"] = collate_tokens([s["target"] for s in samples], pad_idx=self.dictionary.pad())
+        collated["target"] = collate_tokens(
+            [s["target"] for s in samples], pad_idx=self.dictionary.pad()
+        )
         if "prev_output_tokens" in all_keys:
-            collated["prev_output_tokens"] = collate_tokens([s["prev_output_tokens"] for s in samples], pad_idx=self.dictionary.pad())
-        collated["loss_keep_mask"] = collate_tokens([s["loss_keep_mask"] for s in samples], pad_idx=0)
+            collated["prev_output_tokens"] = collate_tokens(
+                [s["prev_output_tokens"] for s in samples],
+                pad_idx=self.dictionary.pad(),
+            )
+        collated["loss_keep_mask"] = collate_tokens(
+            [s["loss_keep_mask"] for s in samples], pad_idx=0
+        )
         net_input_keys = ("src_tokens", "prev_output_tokens")
-        res = {
-            key: collated[key]
-            for key in all_keys if key not in net_input_keys
-        }
+        res = {key: collated[key] for key in all_keys if key not in net_input_keys}
         res["net_input"] = {
-            key: collated[key]
-            for key in  net_input_keys
-            if key in all_keys
+            key: collated[key] for key in net_input_keys if key in all_keys
         }
         ntokens_key = "src_tokens" if "src_tokens" in all_keys else "prev_output_tokens"
-        res["ntokens"] = sum(len(s[ntokens_key]) for s in samples) 
+        res["ntokens"] = sum(len(s[ntokens_key]) for s in samples)
         res["nsentences"] = len(samples)
         return res
 
@@ -399,8 +422,6 @@ class ChomskyHierarchyTask(FairseqTask):
         self._source_dictionary = dictionary
         self._target_dictionary = dictionary
         self.cfg = cfg
-        # from jax.config import config
-        # config.update('jax_disable_jit', True)
 
     @property
     def source_dictionary(self):
@@ -424,7 +445,7 @@ class ChomskyHierarchyTask(FairseqTask):
         # make source dictionary
         numbers = [str(i) for i in range(10)]
         letters = list("abcdefghijklmnopqrstuvwxyz")
-        symbols =  numbers + letters
+        symbols = numbers + letters
         assert 2 <= cfg.vocab_size < len(symbols)
         dictionary = Dictionary()
         # for symbol in symbols[:cfg.vocab_size]:
@@ -434,7 +455,7 @@ class ChomskyHierarchyTask(FairseqTask):
 
     def load_dataset(
         self, split: str, epoch=1, combine=False, **kwargs
-    ) -> ChomskyDataset:
+    ) -> ChomskyIndexedDataset:
         data_dir = Path(self.cfg.data)
         assert data_dir.is_dir()
         src_fname = f"{split}.{self.cfg.task_name}.src"
@@ -452,47 +473,3 @@ class ChomskyHierarchyTask(FairseqTask):
         with torch.no_grad():
             loss, sample_size, logging_output = criterion(model, sample)
         return loss, sample_size, logging_output
-
-    def begin_valid_epoch(self, epoch, model):
-        """Hook function called before the start of each validation epoch."""
-        # del self.datasets["train"]
-        # breakpoint()
-        # print()
-        pass
-
-#   @abc.abstractmethod
-#   def sample_batch(self, rng: chex.PRNGKey, batch_size: int,
-#                    length: int) -> Batch:
-#     """Returns a batch of inputs/outputs."""
-
-#   def pointwise_loss_fn(self, output: chex.Array,
-#                         target: chex.Array) -> chex.Array:
-#     """Returns the pointwise loss between an output and a target."""
-#     return -target * jnn.log_softmax(output)
-
-#   def accuracy_fn(self, output: chex.Array, target: chex.Array) -> chex.Array:
-#     """Returns the accuracy between an output and a target."""
-#     return (jnp.argmax(output,
-#                        axis=-1) == jnp.argmax(target,
-#                                               axis=-1)).astype(jnp.float32)
-
-#   def accuracy_mask(self, target: chex.Array) -> chex.Array:
-#     """Returns a mask to compute the accuracies, to remove the superfluous ones."""
-#     # Target is a shape of shape (B, T, C) where C is the number of classes.
-#     # We want a mask per input (B, T), so we take this shape.
-#     return jnp.ones(target.shape[:-1])
-
-#   @property
-#   @abc.abstractmethod
-#   def input_size(self) -> int:
-#     """Returns the size of the input of the models trained on this task."""
-
-#   @property
-#   @abc.abstractmethod
-#   def output_size(self) -> int:
-#     """Returns the size of the output of the models trained on this task."""
-
-#   def output_length(self, input_length: int) -> int:
-#     """Returns the length of the output, given an input length."""
-#     del input_length
-#     return 1

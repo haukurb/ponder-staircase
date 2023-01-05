@@ -44,6 +44,7 @@ dataset:
 
 optimizer:
   _name: adam
+  weight_decay: 0.01
 
 optimization:
   max_update: 100_000
@@ -66,7 +67,7 @@ checkpoint:
   no_save: false
   no_epoch_checkpoints: false
   no_last_checkpoints: false
-  save_dir: checkpoints
+  save_dir: ???
   # reset_dataloader: true
   # reset_optimizer: true
   # reset_lr_scheduler: true
