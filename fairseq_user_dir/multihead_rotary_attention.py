@@ -91,10 +91,8 @@ class MultiheadRotaryAttention(MultiheadAttention):
         self.rotary_embedding = None
         if position_encoding in ("xpos", "rope"):
             use_scaling = position_encoding=="xpos"
-            logger.info(f"Using rotary position encoding with use_scaling={use_scaling}")
             self.rotary_embedding = torchscale_xpos_relative_position.XPos(head_dim=embed_dim, use_scaling=position_encoding=="xpos")
         else:
-            logger.info(f"Using no position embedding")
             assert position_encoding == "none"
 
     def _xformers_attn_forward(
