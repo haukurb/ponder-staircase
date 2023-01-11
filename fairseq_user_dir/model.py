@@ -47,6 +47,8 @@ from fairseq.utils import safe_getattr
 from icecream import ic
 from torch import Tensor
 
+from omegaconf import II
+
 import numpy as np
 
 from . import multihead_rotary_attention
@@ -85,6 +87,8 @@ class StaircaseTransformerConfig(TransformerConfig):
     use_alibi: bool = field(default=False)
     use_fixed_chunking: bool = field(default=False)
     chunk_length_parameter: int = field(default=4)
+    valid_use_fixed_chunking: bool = II("model.use_fixed_chunking")
+    valid_chunk_length_parameter: int = II("model.chunk_length_parameter")
     position_encoding: POSITION_ENCODING_CHOICES = field(  # type: ignore
         default="xpos",
     )
@@ -93,6 +97,14 @@ class StaircaseTransformerConfig(TransformerConfig):
         self.decoder.layers = (
             self.num_bottom_layers + self.num_staircase_layers + self.num_top_layers
         )
+        self.decoder.layers = (
+            self.num_bottom_layers + self.num_staircase_layers + self.num_top_layers
+        )
+        # so we can build the model without going through hydra
+        if self.valid_use_fixed_chunking == II("model.valid_use_fixed_chunking"):
+            self.valid_use_fixed_chunking = self.use_fixed_chunking
+        if self.valid_chunk_length_parameter == II("model.valid_chunk_length_parameter"):
+            self.valid_chunk_length_parameter = self.chunk_length_parameter
 
 
 @register_model("staircase_lm", dataclass=StaircaseTransformerConfig)
@@ -341,14 +353,15 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             # used a fixed chunk size as scaffolding for now
             fixed_chunk_len = 4
 
-            split_param = self.cfg.chunk_length_parameter
-            if not self.cfg.use_fixed_chunking:
+            use_fixed_chunking = self.cfg.use_fixed_chunking if self.training else self.cfg.valid_use_fixed_chunking
+            split_param = self.cfg.chunk_length_parameter if self.training else self.cfg.valid_chunk_length_parameter
+            if not use_fixed_chunking:
                 rng = np.random.default_rng(seed=hash(prev_output_tokens) % 2**31)
-                chunk_lens = rng.poisson(lam=self.cfg.chunk_length_parameter, size=slen)
+                chunk_lens = rng.poisson(lam=split_param, size=slen)
                 cumulative = np.cumsum(chunk_lens)
                 cutoff = cumulative.searchsorted(slen)
                 last_chunk_len = slen - cumulative[cutoff - 1]
-                chunk_lens = chunk_lens[:cutoff].tolist()
+                chunk_lens = chunk_lens[:cutoff].tolist()  # type: ignore
                 chunk_lens.append(last_chunk_len)
                 split_param = chunk_lens
 

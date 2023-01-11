@@ -40,7 +40,6 @@ CHOMSKY_SUBTASK_CHOICES = ChoiceEnum(
         "stack_manipulation",
     ]
 )
-_PONDER_TOKEN_STRING = "<ponder>"
 
 
 @dataclass
@@ -52,48 +51,11 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
             "help": "Sequence-to-sequence tasks belonging to differing levels in the Chomsky Hierarchy."
         },
     )
-    modulus: int = field(
-        default=5,
-        metadata={
-            "help": "Modulus for 'modular_arithmetic', 'modular_arithmetic_brackets', and 'solve_equation' tasks."
-        },
-    )
-    vocab_size: int = field(
-        default=2,
-        metadata={
-            "help": "Vocab size for 'reverse_string', 'duplicate_string', and 'odds_first' tasks."
-        },
-    )
-    length_training_range: int = field(
-        default=40,
-        metadata={
-            "help": "Maximum length of samples that are sampled during training."
-        },
-    )
-    length_eval_range: int = field(
-        default=540,
-        metadata={
-            "help": (
-                "Maximum length of samples during evaluation, note that all eval"
-                "samples are of length at least 'length_training_range'."
-            )
-        },
-    )
     seed: int = II("common.seed")
     batch_size: int = II("dataset.batch_size")
     epoch_size: int = field(
         default=10_000,
         metadata={"help": ("Total number of sequences in training epoch")},
-    )
-    test_size: int = field(
-        default=2,
-        metadata={"help": ("Total number of sequences in test set")},
-    )
-    use_encoder_decoder_format: bool = field(
-        default=False,
-        metadata={
-            "help": ("Put input sequence into source instead of prev_output_tokens")
-        },
     )
     allow_loss_on_problem_statement: bool = field(
         default=False,
@@ -103,10 +65,14 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
             )
         },
     )
-    # ponder_density: int = field(
-    #     default=2,
-    #     metadata={"help": ("Total number of sequences in test set")},
-    # )
+    ponder_prob: float = field(
+        default=0,
+        metadata={"help": ("Probability to insert a ponder token")},
+    )
+    ponder_count: int = field(
+        default=2,
+        metadata={"help": ("Maximum amount of sequential ponder tokensl (bernoulli trial)")},
+    )
 
     def __post_init__(self):
         if self.seed == II("common.seed"):
@@ -140,6 +106,7 @@ class ChomskyIndexedDataset(FairseqDataset):
         self.separator_seq = torch.tensor([self.dictionary.bos()]).long()
         self.eos_seq = torch.tensor([self.dictionary.bos()]).long()
         self.eos_idx = self.dictionary.eos()
+        self.ponder_idx = self.dictionary.unk()
         assert (
             self.src_dataset is not None
         ), f"Expected to find dataset at {src_path}.bin"
@@ -175,6 +142,33 @@ class ChomskyIndexedDataset(FairseqDataset):
                     torch.ones_like(self.eos_seq),
                 ]
             )
+
+        if self.cfg.ponder_prob <= 0:
+            return output
+
+        seq_len = len(output["target"])
+        with data_utils.numpy_seed(self.cfg.seed, index):
+            ponder_counts = np.random.binomial(self.cfg.ponder_count, self.cfg.ponder_prob, size=seq_len)
+            # no use ponder after last token
+            ponder_counts[-1] = 0
+
+            # we interleave the original sequence with a ponder token after each original token
+            target_with_ponder_tokens = np.stack([output["target"].numpy(), np.repeat(self.ponder_idx, seq_len)]).transpose().reshape(-1)
+            # we interleave 1's (since we do not want to repeat or omit tokens from original sequence) 
+            # and number of repeats of the ponder token that follows it (0 if no ponder token follows)
+            all_token_counts = np.stack([np.repeat(1, seq_len), ponder_counts]).transpose().reshape(-1)
+            new_output_seq = np.repeat(target_with_ponder_tokens, all_token_counts)
+
+            # same as above, but for loss mask
+            # XXX NOTE: we are hardcoding ponder to not participate in CE loss
+            new_loss_mask = np.repeat(
+                np.stack([output["loss_keep_mask"].numpy(), np.repeat(0, seq_len)]).transpose().reshape(-1),
+                all_token_counts,
+            )
+
+        output["target"] = torch.from_numpy(new_output_seq)
+        output["src_tokens"] = output["target"].roll(1)
+        output["new_loss_mask"] = torch.from_numpy(new_loss_mask)
         return output
 
     def __len__(self):
@@ -264,12 +258,9 @@ class ChomskyHierarchyTask(FairseqTask):
         numbers = [str(i) for i in range(10)]
         letters = list("abcdefghijklmnopqrstuvwxyz")
         symbols = numbers + letters
-        assert 2 <= cfg.vocab_size < len(symbols)
         dictionary = Dictionary()
-        # for symbol in symbols[:cfg.vocab_size]:
         for symbol in symbols:
             dictionary.add_symbol(symbol)
-        dictionary.add_symbol(_PONDER_TOKEN_STRING)
         return cls(cfg, dictionary, **kwargs)
 
     def load_dataset(
