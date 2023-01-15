@@ -69,14 +69,87 @@ POSITION_ENCODING_CHOICES = ChoiceEnum(
 )
 
 
-@dataclass
+# XXX: we should add optional forgetting
 class StaircaseCache:
-    finalized_chunks: List[torch.Tensor] = field(default_factory=list)
+    """XXX: If max_context_size is short (under 128) it causes nans in the outputs of the staircase layers.
+            We assume this is because of activation norm magnification (discussed in deepnet paper).
+            We could solve this by applying a context size curriculum:
+            - schedule provided as piecewise linear function or similar
+            - purely dynamic if no nan is found for k steps, narrow the context size (until target context size is reach)
+    """
+    def __init__(self, *, max_context_size: Optional[int]=None):
+        self.finalized_chunks: List[torch.Tensor] = []
+        self.unmerged_chunks: List[torch.Tensor] = []
+        self._depths: List[int] = []
+        self.chunk_lengths: List[int] = []
+        self.max_context_size = max_context_size
+        self.max_unconsolidated: int = 4
+        self.valid_cache = True  # for cache invalidation
+        # we don't need to recompute state tensor if nothing has been added to the cache
+        self.cached_state = None
+        if self.max_context_size and (self.max_context_size % 5 == 0):
+            self.max_unconsolidated = 5
+        elif self.max_context_size and not (self.max_context_size % 4 == 0):
+            raise ValueError("max_context_size must be divisible by 4 or 5")
 
     @property
-    def num_vecs(self):
-        cache_len = sum(chunk.shape[0] for chunk in self.finalized_chunks)
+    def num_forgotten(self):
+        state = self.get_state()
+        if state is None:
+            return 0
+        return self.length - state.shape[0]
+
+    @property
+    def length(self):
+        cache_len = sum(chunk.shape[0] for chunk in self.unmerged_chunks)
         return cache_len
+
+    def consolidate(self):
+        """ Merges chunks on the right side of the cache when enough have been added.
+        We want to minimize the depth of each chunk in the merge tree for faster backprop time, so we track chunk depths
+        and merge accordingly.
+        Effectiveness with max_unconsolidated in (2,4,8):
+            - A 3-8-1 transformer (dim=640) on seq_len=100 and bsz=100 we get 20% higher updates per second with chunk_size=1 (1.22 -> 1.50).
+            - with chunk_size=2 it is still between ~18% and 19% speedup.
+        """
+        consol_start = self._depths.index(self._depths[-1]) if self._depths else 0
+        length_unconsolidated = len(self._depths) - consol_start
+        if length_unconsolidated < self.max_unconsolidated:
+            return
+        self.finalized_chunks[consol_start:] = [torch.cat(self.finalized_chunks[consol_start:])]
+        # consolidate last chunk and increment its depth
+        self._depths[consol_start:] = [self._depths[-1] + 1]
+        # recursively consolidate if we can
+        self.consolidate()
+
+    def get_state(self):
+        if self.valid_cache:
+            return self.cached_state
+
+        if self.max_context_size is None:
+            return torch.cat(self.finalized_chunks, dim=0)
+        # TODO: consider optimizing this like consolidate works?
+        if self.unmerged_chunks:
+            num_chunks_from_tail = np.searchsorted(
+                # reverse list, find first index of cumulative length that exceeds context size
+                np.cumsum(self.chunk_lengths[-self.max_context_size:][::-1]),
+                self.max_context_size
+            ) + 1
+            # we add one because cumsum isn't prepended with zero
+            return torch.cat(self.unmerged_chunks[-num_chunks_from_tail:], dim=0)
+        return None
+
+    def add(self, chunk):
+        self.finalized_chunks.append(chunk)
+        self.unmerged_chunks.append(chunk)
+        self.chunk_lengths.append(chunk.shape[0])
+        self._depths.append(0)
+        self.consolidate()
+        self.valid_cache = False
+        _ = self.get_state()
+
+    def get_global_state(self):
+        return torch.cat(self.unmerged_chunks, dim=0)
 
 
 @dataclass
@@ -92,6 +165,8 @@ class StaircaseTransformerConfig(TransformerConfig):
     position_encoding: POSITION_ENCODING_CHOICES = field(  # type: ignore
         default="xpos",
     )
+    max_context_size: int = field(default=-1)
+    roll_staircase: bool = field(default=True)
 
     def __post_init__(self):
         self.decoder.layers = (
@@ -344,6 +419,7 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             )
             inner_states.append(x)
 
+        # start of staircase part of decoder
         if  self.staircase_layers:
             _, _, edim = x.shape
 
@@ -369,14 +445,17 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             chunks = x.split(split_param, dim=0)
             chunk_lens = [chunk.shape[0] for chunk in chunks]
 
-            cache = StaircaseCache()
+            # to store vectors when they reach the output side of the staircase
+            cache = StaircaseCache(max_context_size=self.cfg.max_context_size)
 
             # queue chunked input so that we only input one chunk a at a time
             chunk_queue = deque(chunks)
             total_staircase_forwards = len(chunks) + len(self.staircase_layers) - 1
 
-            # TODO: only roll staircase while training
-            staircase_start = torch.randint(0, len(self.staircase_layers), size=[1])[0]
+            # roll staircase randomly during training, this might not be needed
+            staircase_start = 0
+            if self.training and self.cfg.roll_staircase:
+                staircase_start = torch.randint(0, len(self.staircase_layers), size=[1])[0]
             rolled_staircase = (
                 self.staircase_layers[staircase_start:]
                 + self.staircase_layers[:staircase_start]
@@ -407,18 +486,23 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                 assert self_attn_mask is not None
                 # XXX TODO: self_attn_mask will not work during inference (we don't properly handle incremental_state)
                 assert incremental_state is None
+                extra_state = cache.get_state()
                 nqueries = x.shape[0]
                 curr_self_attn_mask = self_attn_mask
-                if cache.num_vecs > 0:
+                if extra_state is not None:
                     assert self_attn_mask.dtype in (torch.float16, torch.float32, torch.float64)
                     # assert isinstance(self_attn_mask, torch.FloatTensor) or isinstance(self_attn_mask, torch.FloatTensor)
-                    # mask is additive, not multiplicative
-                    curr_self_attn_mask = torch.cat([self_attn_mask.new_zeros(nqueries, cache.num_vecs), self_attn_mask], dim=1)
+                    # mask is additive, not multiplicative, so a value of zero means a given position is included
+                    # shape: [Time, Batch, Embed]
+                    num_extra_keys = extra_state.shape[0]
+                    # mask shape: [NumQueries, NumKeys]
+                    curr_self_attn_mask = torch.cat([self_attn_mask.new_zeros(nqueries, num_extra_keys), self_attn_mask], dim=1)
 
                 # self_attn_padding_mask: [Batch, KeySeqLen]
                 curr_self_attn_padding_mask = self_attn_padding_mask
                 if self_attn_padding_mask is not None:
-                    curr_self_attn_padding_mask = self_attn_padding_mask[:, :cache.num_vecs + nqueries]
+                    # mask shape: [Batch, Time]
+                    curr_self_attn_padding_mask = self_attn_padding_mask[:, cache.num_forgotten:cache.length + nqueries]
 
                 x, layer_attn, _ = layer(
                     x,
@@ -429,13 +513,14 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                     self_attn_padding_mask=curr_self_attn_padding_mask,
                     need_attn=False,
                     need_head_weights=False,
-                    key_cache=cache,
+                    extra_state=extra_state,
                 )
+                _layer_x = x
                 # XXX: if we skip a layer due to layerdrop, we still want to count it in staircase_nforwards,
                 #      that means we cannot use layerdropmodule from fairseq to implement our layerdrop
 
-                # after a chunk as been forwarded num_staircase_layers many times it becomes a key_only chunk
-                # we find the first chunk where it hasnt been forwarded that many times
+                # After a chunk as been forwarded num_staircase_layers many times it is finalized and becomes
+                # a key_only chunk.  We find the first chunk where it hasnt been forwarded that many times.
                 nforwards_per_chunk[ncached_chunks:nchunks_in_staircase] += 1
                 if nforwards_per_chunk.ge(len(self.staircase_layers)).any():
                     # check if any chunk as been forwarded enough times to leave the staircase
@@ -451,13 +536,14 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                         ]
                     )
                     # partition x into next inputs and cached inputs
-                    cache.finalized_chunks.append(x[:nvecs_to_be_cached])
+                    cache.add(x[:nvecs_to_be_cached])
                     x = x[nvecs_to_be_cached:]
                     # keep track of all chunks forwarded
                     ncached_chunks += nchunks_finished_this_forward
 
             assert x.shape[0] == 0, "All have been moved to the cache at this point"
-            x = torch.cat(cache.finalized_chunks, dim=0)
+            x = cache.get_global_state()
+        # end of staircase part of decoder
 
         for idx, layer in enumerate(self.top_layers):
             if incremental_state is None and not full_context_alignment:
@@ -509,7 +595,7 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
         self_attn_padding_mask: Optional[torch.Tensor] = None,
         need_attn: bool = False,
         need_head_weights: bool = False,
-        key_cache: Optional[StaircaseCache] = None,
+        extra_state: Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -581,10 +667,10 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
         """
         begin modification of original function
         """
-        if key_cache is None:
+        if extra_state is None:
             x_with_cache = x
         else:
-            x_with_cache = torch.cat(key_cache.finalized_chunks + [x], dim=0)
+            x_with_cache = torch.cat([extra_state, x], dim=0)
         x, attn = self.self_attn(
             query=x,
             key=x_with_cache,

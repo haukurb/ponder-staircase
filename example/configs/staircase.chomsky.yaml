@@ -56,7 +56,7 @@ optimization:
 
 lr_scheduler:
   _name: polynomial_decay
-  warmup_updates: 1
+  warmup_updates: 500
 
 checkpoint:
   save_interval_updates: 2_500

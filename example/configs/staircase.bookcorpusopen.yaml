@@ -43,7 +43,7 @@ dataset:
   validate_interval: 5_000
   # we need this since our validation set is 1/4 of the entire corpus
   # with 20k tokens eff. bsz this means 570 steps ~ 1% corpus, we use 2*570=1140 or ~2%
-  max_valid_steps: 1140
+  max_valid_steps: 570
   # ----
   # # with 20k tokens eff. bsz this means 570 steps ~ 1% corpus, we use 25*570=1140 or ~25%
   # max_valid_steps: 14250
