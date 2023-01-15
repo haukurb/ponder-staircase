@@ -73,6 +73,10 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
         default=2,
         metadata={"help": ("Maximum amount of sequential ponder tokensl (bernoulli trial)")},
     )
+    remap_with_eq_group: bool = field(
+        default=False,
+        metadata={"help": ("Remap inputs randomly from given equivalence group")},
+    )
 
     def __post_init__(self):
         if self.seed == II("common.seed"):
@@ -83,7 +87,7 @@ class ChomskyHierarchyTaskConfig(FairseqDataclass):
 
 class ChomskyIndexedDataset(FairseqDataset):
     def __init__(
-        self, cfg: ChomskyHierarchyTaskConfig, dictionary, *, src_path, tgt_path
+        self, cfg: ChomskyHierarchyTaskConfig, dictionary, *, src_path, tgt_path, is_training=True,
     ):
         super().__init__()
         self.cfg = cfg
@@ -107,6 +111,7 @@ class ChomskyIndexedDataset(FairseqDataset):
         self.eos_seq = torch.tensor([self.dictionary.bos()]).long()
         self.eos_idx = self.dictionary.eos()
         self.ponder_idx = self.dictionary.unk()
+        self.is_training = is_training
         assert (
             self.src_dataset is not None
         ), f"Expected to find dataset at {src_path}.bin"
@@ -116,6 +121,22 @@ class ChomskyIndexedDataset(FairseqDataset):
 
     def __getitem__(self, index):
         src_tokens = self.src_dataset[index]
+        # since we add separator ourselves
+        src_tokens = src_tokens if src_tokens[-1] != self.eos_idx else src_tokens[:-1]
+
+        with data_utils.numpy_seed(self.cfg.seed, index):
+            # we only do remap half the time and never during validation
+            do_remap = self.cfg.remap_with_eq_group and np.random.rand() < 0.5
+            if do_remap:
+                # noop a b c
+                #    0 1 2 3
+                group_offsets = np.random.randint(4, size=len(src_tokens))
+                zero = self.dictionary.index("0")
+                nine = self.dictionary.index("9")
+                assert (zero <= src_tokens.min()) and (src_tokens.max() <= nine)
+                EQ_GROUP_LEN = 10  # numbers 0-9 are 10 total
+                src_tokens = src_tokens + EQ_GROUP_LEN * group_offsets
+
         # tgt may or may not have eos already
         target = self.tgt_dataset[index]
         # strip eos if it is there (to ensure uniformity)
@@ -143,12 +164,15 @@ class ChomskyIndexedDataset(FairseqDataset):
                 ]
             )
 
-        if self.cfg.ponder_prob <= 0:
+        if self.cfg.ponder_prob <= 0 or not self.is_training:
             return output
 
         seq_len = len(output["target"])
         with data_utils.numpy_seed(self.cfg.seed, index):
-            ponder_counts = np.random.binomial(self.cfg.ponder_count, self.cfg.ponder_prob, size=seq_len)
+            ponder_rate = np.random.rand() * self.cfg.ponder_prob
+            if ponder_rate < 0.05:
+                return output
+            ponder_counts = np.random.binomial(self.cfg.ponder_count, ponder_rate, size=seq_len)
             # no use ponder after last token
             ponder_counts[-1] = 0
 
@@ -168,7 +192,7 @@ class ChomskyIndexedDataset(FairseqDataset):
 
         output["target"] = torch.from_numpy(new_output_seq)
         output["src_tokens"] = output["target"].roll(1)
-        output["new_loss_mask"] = torch.from_numpy(new_loss_mask)
+        output["loss_keep_mask"] = torch.from_numpy(new_loss_mask)
         return output
 
     def __len__(self):
@@ -255,9 +279,16 @@ class ChomskyHierarchyTask(FairseqTask):
             cfg (omegaconf.DictConfig): parsed command-line arguments
         """
         # make source dictionary
-        numbers = [str(i) for i in range(10)]
-        letters = list("abcdefghijklmnopqrstuvwxyz")
-        symbols = numbers + letters
+        # numbers = [str(i) for i in range(10)]
+        # letters = list("abcdefghijklmnopqrstuvwxyz")
+        # symbols = numbers + letters
+
+        numbers = list("0123456789")
+        symbols = list(numbers)
+        for char in "abc":
+            for num in numbers:
+                symbols.append(num + char)
+
         dictionary = Dictionary()
         for symbol in symbols:
             dictionary.add_symbol(symbol)
@@ -270,11 +301,13 @@ class ChomskyHierarchyTask(FairseqTask):
         assert data_dir.is_dir()
         src_fname = f"{split}.{self.cfg.task_name}.src"
         tgt_fname = f"{split}.{self.cfg.task_name}.tgt"
+        is_training = "train" in split
         self.datasets[split] = ChomskyIndexedDataset(
             self.cfg,
             self.dictionary,
             src_path=data_dir / src_fname,
             tgt_path=data_dir / tgt_fname,
+            is_training=is_training,
         )
         return self.datasets[split]
 
