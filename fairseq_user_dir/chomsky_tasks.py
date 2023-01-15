@@ -184,7 +184,7 @@ class ChomskyIndexedDataset(FairseqDataset):
             new_output_seq = np.repeat(target_with_ponder_tokens, all_token_counts)
 
             # same as above, but for loss mask
-            # XXX NOTE: we are hardcoding ponder to not participate in CE loss
+            # NOTE: we are hardcoding ponder to not participate in CE loss
             new_loss_mask = np.repeat(
                 np.stack([output["loss_keep_mask"].numpy(), np.repeat(0, seq_len)]).transpose().reshape(-1),
                 all_token_counts,

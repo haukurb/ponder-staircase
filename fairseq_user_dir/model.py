@@ -71,11 +71,15 @@ POSITION_ENCODING_CHOICES = ChoiceEnum(
 
 # XXX: we should add optional forgetting
 class StaircaseCache:
-    """XXX: If max_context_size is short (under 128) it causes nans in the outputs of the staircase layers.
-            We assume this is because of activation norm magnification (discussed in deepnet paper).
-            We could solve this by applying a context size curriculum:
+    """XXX: If max_context_size is short (under 128) it causes nans in the outputs of the staircase layers for chomsky tasks.
+            We assume this is because of activation norm magnification and exploding gradients and the fact that most of the loss
+            is masked (except a tiny bit at the end).  This does not seem to be a problem for bookcorpusopen models for the
+            tested input size, context size, chunk size and model height.
+
+            Aside from differing layer normalization strategies (decouple layernorm from layers for example).
+            We could be solve this by applying a context size curriculum:
             - schedule provided as piecewise linear function or similar
-            - purely dynamic if no nan is found for k steps, narrow the context size (until target context size is reach)
+            - purely dynamic; if no nan is found for k steps, narrow the context size (until target context size is reach)
     """
     def __init__(self, *, max_context_size: Optional[int]=None):
         self.finalized_chunks: List[torch.Tensor] = []
@@ -498,7 +502,6 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                     # mask shape: [NumQueries, NumKeys]
                     curr_self_attn_mask = torch.cat([self_attn_mask.new_zeros(nqueries, num_extra_keys), self_attn_mask], dim=1)
 
-                # self_attn_padding_mask: [Batch, KeySeqLen]
                 curr_self_attn_padding_mask = self_attn_padding_mask
                 if self_attn_padding_mask is not None:
                     # mask shape: [Batch, Time]
@@ -515,7 +518,13 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                     need_head_weights=False,
                     extra_state=extra_state,
                 )
-                _layer_x = x
+
+                if x.isnan().any():
+                    # xformer attentions have a nan bug when using masks: https://github.com/facebookresearch/xformers/issues/631
+                    # [Batch, Time] -> [Time, Batch]; to match x
+                    query_padding_mask = self_attn_padding_mask[:, cache.length:cache.length + nqueries].transpose(0, 1)
+                    x[query_padding_mask] = 0
+
                 # XXX: if we skip a layer due to layerdrop, we still want to count it in staircase_nforwards,
                 #      that means we cannot use layerdropmodule from fairseq to implement our layerdrop
 
