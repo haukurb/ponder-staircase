@@ -54,13 +54,18 @@ class CrossEntropyWithPonderCriterion(FairseqCriterion):
         assert len(ntargets_per_seq.shape) == 1
         targets_per_seq = target.masked_select(loss_keep_mask).split(ntargets_per_seq.tolist())
         pred_per_seq = net_output[0].argmax(dim=-1).masked_select(loss_keep_mask).split(ntargets_per_seq.tolist())
-        ncorrect = sum([pred.eq(tgt).all().item() for (pred, tgt) in zip(pred_per_seq, targets_per_seq)])
+        ncorrect_seqs = sum([pred.eq(tgt).all().item() for (pred, tgt) in zip(pred_per_seq, targets_per_seq)])
+        # don't count EOS
+        ncorrect_tokens = sum([pred.eq(tgt)[:-1].sum().item() for (pred, tgt) in zip(pred_per_seq, targets_per_seq)])
+        ntarget_tokens = sum((len(tgt) - 1) for tgt in targets_per_seq)
 
         logging_output = {
             "loss": loss.data,
             "ntokens": sample["ntokens"],
             "nsentences": sample["target"].size(0),
-            "ncorrect": ncorrect,
+            "ncorrect_seqs": ncorrect_seqs,
+            "ncorrect_tokens": ncorrect_tokens,
+            "ntarget_tokens": ntarget_tokens,
             "sample_size": sample_size,
         }
         return loss, sample_size, logging_output
@@ -94,7 +99,9 @@ class CrossEntropyWithPonderCriterion(FairseqCriterion):
         loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
         ntokens = sum(log.get("ntokens", 0) for log in logging_outputs)
         sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
-        ncorrect = sum(log.get("ncorrect", 0) for log in logging_outputs)
+        ncorrect_seqs = sum(log.get("ncorrect_seqs", 0) for log in logging_outputs)
+        ncorrect_tokens = sum(log.get("ncorrect_tokens", 0) for log in logging_outputs)
+        ntarget_tokens = sum(log.get("ntarget_tokens", 0) for log in logging_outputs)
         nsentences = sum(log.get("nsentences", 0) for log in logging_outputs)
 
         # we divide by log(2) to convert the loss from base e to base 2
@@ -102,7 +109,10 @@ class CrossEntropyWithPonderCriterion(FairseqCriterion):
             "loss", loss_sum / sample_size / math.log(2), sample_size, round=3
         )
         metrics.log_scalar(
-            "acc", ncorrect / nsentences, nsentences, round=3
+            "acc_tok", ncorrect_tokens / ntarget_tokens, ntarget_tokens, round=3
+        )
+        metrics.log_scalar(
+            "acc_seq", ncorrect_seqs / nsentences, nsentences, round=3
         )
         if sample_size != ntokens:
             metrics.log_scalar(
