@@ -86,15 +86,11 @@ class StaircaseCache:
         self.unmerged_chunks: List[torch.Tensor] = []
         self._depths: List[int] = []
         self.chunk_lengths: List[int] = []
-        self.max_context_size = max_context_size
+        self.max_context_size = max_context_size if max_context_size >= 0 else None
         self.max_unconsolidated: int = 4
         self.valid_cache = True  # for cache invalidation
         # we don't need to recompute state tensor if nothing has been added to the cache
         self.cached_state = None
-        if self.max_context_size and (self.max_context_size % 5 == 0):
-            self.max_unconsolidated = 5
-        elif self.max_context_size and not (self.max_context_size % 4 == 0):
-            raise ValueError("max_context_size must be divisible by 4 or 5")
 
     @property
     def num_forgotten(self):
@@ -132,7 +128,9 @@ class StaircaseCache:
 
         if self.max_context_size is None:
             return torch.cat(self.finalized_chunks, dim=0)
-        # TODO: consider optimizing this like consolidate works?
+        elif  self.max_context_size == 0:
+            return None
+        # this could be optimized with consolidation (for up to 10-15% speedup for very long contexts~128)
         if self.unmerged_chunks:
             num_chunks_from_tail = np.searchsorted(
                 # reverse list, find first index of cumulative length that exceeds context size
@@ -163,14 +161,15 @@ class StaircaseTransformerConfig(TransformerConfig):
     num_top_layers: int = field(default=1)
     use_alibi: bool = field(default=False)
     use_fixed_chunking: bool = field(default=False)
-    chunk_length_parameter: int = field(default=4)
+    chunk_length_parameter: float = field(default=4)
     valid_use_fixed_chunking: bool = II("model.use_fixed_chunking")
-    valid_chunk_length_parameter: int = II("model.chunk_length_parameter")
+    valid_chunk_length_parameter: float = II("model.chunk_length_parameter")
     position_encoding: POSITION_ENCODING_CHOICES = field(  # type: ignore
         default="xpos",
     )
     max_context_size: int = field(default=-1)
     roll_staircase: bool = field(default=True)
+    recurrent_stride: int = field(default=1)
 
     def __post_init__(self):
         self.decoder.layers = (
@@ -435,6 +434,7 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
 
             use_fixed_chunking = self.cfg.use_fixed_chunking if self.training else self.cfg.valid_use_fixed_chunking
             split_param = self.cfg.chunk_length_parameter if self.training else self.cfg.valid_chunk_length_parameter
+            split_param = int(split_param) if use_fixed_chunking else split_param
             if not use_fixed_chunking:
                 rng = np.random.default_rng(seed=hash(prev_output_tokens) % 2**31)
                 chunk_lens = rng.poisson(lam=split_param, size=slen)
@@ -444,6 +444,7 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                 chunk_lens = chunk_lens[:cutoff].tolist()  # type: ignore
                 chunk_lens.append(last_chunk_len)
                 split_param = chunk_lens
+
 
             # x is of shape [SeqLen, Batch, NumHidden]
             chunks = x.split(split_param, dim=0)
@@ -471,13 +472,20 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             nchunks_in_staircase = (
                 0  # number of chunks removed from the queue and put into the staircase
             )
-            ncached_chunks = (
+            nfinished_chunks = (
                 0  # number of chunks removed from staircase after they are finalized
             )
-            for _forward_count, layer in enumerate(
-                islice(cycle(rolled_staircase), total_staircase_forwards), start=1
-            ):
-                if chunk_queue:
+
+            # the maximum number of forwards we need to make
+            myiter = islice(cycle(rolled_staircase), len(chunks) * max(len(self.staircase_layers), self.cfg.recurrent_stride))
+
+            recurrence_counter = self.cfg.recurrent_stride
+            while True:
+                # ic(nforwards_per_chunk[:nchunks_in_staircase+1])
+                layer = next(myiter)
+
+                if chunk_queue and self.cfg.recurrent_stride <= recurrence_counter:
+                    recurrence_counter = 0
                     next_chunk = chunk_queue.popleft()
                     x = torch.cat([x, next_chunk], dim=0)
                     nchunks_in_staircase += 1
@@ -519,7 +527,7 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                     extra_state=extra_state,
                 )
 
-                if x.isnan().any():
+                if x.isnan().any() and self_attn_padding_mask is not None:
                     # xformer attentions have a nan bug when using masks: https://github.com/facebookresearch/xformers/issues/631
                     # [Batch, Time] -> [Time, Batch]; to match x
                     query_padding_mask = self_attn_padding_mask[:, cache.length:cache.length + nqueries].transpose(0, 1)
@@ -530,28 +538,32 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
 
                 # After a chunk as been forwarded num_staircase_layers many times it is finalized and becomes
                 # a key_only chunk.  We find the first chunk where it hasnt been forwarded that many times.
-                nforwards_per_chunk[ncached_chunks:nchunks_in_staircase] += 1
+                nforwards_per_chunk[nfinished_chunks:nchunks_in_staircase] += 1
                 if nforwards_per_chunk.ge(len(self.staircase_layers)).any():
                     # check if any chunk as been forwarded enough times to leave the staircase
                     nchunks_finished_this_forward = (
-                        nforwards_per_chunk[ncached_chunks:]
+                        nforwards_per_chunk[nfinished_chunks:]
                         .ge(len(self.staircase_layers))
                         .sum()
                     )
                     # cache all the vectors from those chunks (can be mnore than one chunk)
                     nvecs_to_be_cached = sum(
                         chunk_lens[
-                            ncached_chunks : ncached_chunks + nchunks_finished_this_forward
+                            nfinished_chunks : nfinished_chunks + nchunks_finished_this_forward
                         ]
                     )
                     # partition x into next inputs and cached inputs
                     cache.add(x[:nvecs_to_be_cached])
                     x = x[nvecs_to_be_cached:]
                     # keep track of all chunks forwarded
-                    ncached_chunks += nchunks_finished_this_forward
+                    nfinished_chunks += nchunks_finished_this_forward
+                if x.shape[0] == 0 and not chunk_queue:
+                    break
+                recurrence_counter += 1
 
             assert x.shape[0] == 0, "All have been moved to the cache at this point"
             x = cache.get_global_state()
+            inner_states.append(x)
         # end of staircase part of decoder
 
         for idx, layer in enumerate(self.top_layers):
