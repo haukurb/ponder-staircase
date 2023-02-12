@@ -43,7 +43,7 @@ from fairseq.models.transformer_lm import TransformerLanguageModel
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.transformer_layer import TransformerDecoderLayerBase
 from fairseq.dataclass import ChoiceEnum
-from fairseq.utils import safe_getattr
+from fairseq.utils import safe_getattr, set_torch_seed
 from icecream import ic
 from torch import Tensor
 
@@ -52,6 +52,9 @@ from omegaconf import II
 import numpy as np
 
 from . import multihead_rotary_attention
+from .piecewise_schedule import PiecewiseBooleanFn, PiecewiseLinearFn
+
+# import
 
 """
 Our alternatives for (length extrapolatable) rotary encodings are:
@@ -72,16 +75,17 @@ POSITION_ENCODING_CHOICES = ChoiceEnum(
 # XXX: we should add optional forgetting
 class StaircaseCache:
     """XXX: If max_context_size is short (under 128) it causes nans in the outputs of the staircase layers for chomsky tasks.
-            We assume this is because of activation norm magnification and exploding gradients and the fact that most of the loss
-            is masked (except a tiny bit at the end).  This does not seem to be a problem for bookcorpusopen models for the
-            tested input size, context size, chunk size and model height.
+    We assume this is because of activation norm magnification and exploding gradients and the fact that most of the loss
+    is masked (except a tiny bit at the end).  This does not seem to be a problem for bookcorpusopen models for the
+    tested input size, context size, chunk size and model height.
 
-            Aside from differing layer normalization strategies (decouple layernorm from layers for example).
-            We could be solve this by applying a context size curriculum:
-            - schedule provided as piecewise linear function or similar
-            - purely dynamic; if no nan is found for k steps, narrow the context size (until target context size is reach)
+    Aside from differing layer normalization strategies (decouple layernorm from layers for example).
+    We could be solve this by applying a context size curriculum:
+    - schedule provided as piecewise linear function or similar
+    - purely dynamic; if no nan is found for k steps, narrow the context size (until target context size is reach)
     """
-    def __init__(self, *, max_context_size: Optional[int]=None):
+
+    def __init__(self, *, max_context_size: Optional[int] = None):
         self.finalized_chunks: List[torch.Tensor] = []
         self.unmerged_chunks: List[torch.Tensor] = []
         self._depths: List[int] = []
@@ -105,7 +109,7 @@ class StaircaseCache:
         return cache_len
 
     def consolidate(self):
-        """ Merges chunks on the right side of the cache when enough have been added.
+        """Merges chunks on the right side of the cache when enough have been added.
         We want to minimize the depth of each chunk in the merge tree for faster backprop time, so we track chunk depths
         and merge accordingly.
         Effectiveness with max_unconsolidated in (2,4,8):
@@ -116,7 +120,9 @@ class StaircaseCache:
         length_unconsolidated = len(self._depths) - consol_start
         if length_unconsolidated < self.max_unconsolidated:
             return
-        self.finalized_chunks[consol_start:] = [torch.cat(self.finalized_chunks[consol_start:])]
+        self.finalized_chunks[consol_start:] = [
+            torch.cat(self.finalized_chunks[consol_start:])
+        ]
         # consolidate last chunk and increment its depth
         self._depths[consol_start:] = [self._depths[-1] + 1]
         # recursively consolidate if we can
@@ -128,15 +134,18 @@ class StaircaseCache:
 
         if self.max_context_size is None:
             return torch.cat(self.finalized_chunks, dim=0)
-        elif  self.max_context_size == 0:
+        elif self.max_context_size == 0:
             return None
         # this could be optimized with consolidation (for up to 10-15% speedup for very long contexts~128)
         if self.unmerged_chunks:
-            num_chunks_from_tail = np.searchsorted(
-                # reverse list, find first index of cumulative length that exceeds context size
-                np.cumsum(self.chunk_lengths[-self.max_context_size:][::-1]),
-                self.max_context_size
-            ) + 1
+            num_chunks_from_tail = (
+                np.searchsorted(
+                    # reverse list, find first index of cumulative length that exceeds context size
+                    np.cumsum(self.chunk_lengths[-self.max_context_size :][::-1]),
+                    self.max_context_size,
+                )
+                + 1
+            )
             # we add one because cumsum isn't prepended with zero
             return torch.cat(self.unmerged_chunks[-num_chunks_from_tail:], dim=0)
         return None
@@ -160,16 +169,19 @@ class StaircaseTransformerConfig(TransformerConfig):
     num_staircase_layers: int = field(default=4)
     num_top_layers: int = field(default=1)
     use_alibi: bool = field(default=False)
-    use_fixed_chunking: bool = field(default=False)
-    chunk_length_parameter: float = field(default=4)
-    valid_use_fixed_chunking: bool = II("model.use_fixed_chunking")
-    valid_chunk_length_parameter: float = II("model.chunk_length_parameter")
+    use_fixed_chunking: Optional[str] = field(default="0")
+    chunk_length_parameter: Optional[str] = field(default="0")
+    valid_use_fixed_chunking: Optional[str] = II("model.use_fixed_chunking")
+    valid_chunk_length_parameter: Optional[str] = II("model.chunk_length_parameter")
+
     position_encoding: POSITION_ENCODING_CHOICES = field(  # type: ignore
         default="xpos",
     )
-    max_context_size: int = field(default=-1)
+    max_context_size: Optional[str] = field(default="4")
     roll_staircase: bool = field(default=True)
-    recurrent_stride: int = field(default=1)
+    recurrent_stride: Optional[str] = field(default="4")
+    # proportion of samples that will execute in normal mode
+    standard_prob: Optional[float] = field(default=None)
 
     def __post_init__(self):
         self.decoder.layers = (
@@ -181,7 +193,9 @@ class StaircaseTransformerConfig(TransformerConfig):
         # so we can build the model without going through hydra
         if self.valid_use_fixed_chunking == II("model.valid_use_fixed_chunking"):
             self.valid_use_fixed_chunking = self.use_fixed_chunking
-        if self.valid_chunk_length_parameter == II("model.valid_chunk_length_parameter"):
+        if self.valid_chunk_length_parameter == II(
+            "model.valid_chunk_length_parameter"
+        ):
             self.valid_chunk_length_parameter = self.chunk_length_parameter
 
 
@@ -218,6 +232,7 @@ class StaircaseTransformerDecoderModel(TransformerLanguageModel):
 
     def __init__(self, decoder):
         super().__init__(decoder)
+        self.num_updates = 0
 
     @classmethod
     def build_model(cls, cfg, task):
@@ -228,13 +243,17 @@ class StaircaseTransformerDecoderModel(TransformerLanguageModel):
             cfg, task.source_dictionary, cfg.decoder.embed_dim
         )
 
-        cfg.decoder.layers = cfg.num_bottom_layers +  cfg.num_staircase_layers + cfg.num_top_layers
+        cfg.decoder.layers = (
+            cfg.num_bottom_layers + cfg.num_staircase_layers + cfg.num_top_layers
+        )
         decoder = StaircaseTransformerDecoder(
             cfg,
             task.source_dictionary,
             embed_tokens,
             no_encoder_attn=True,
         )
+        # we use this to have reproducible RNG across multiple GPUs that needs to be the same
+        # on a given time step
         return cls(decoder)
 
 
@@ -270,6 +289,32 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             self.staircase_layers.append(self.layers[i])
         for i in top_range:
             self.top_layers.append(self.layers[i])
+
+        self.curriculum_use_fixed_chunking = PiecewiseBooleanFn.from_string(
+            self.cfg.use_fixed_chunking
+        )
+        self.curriculum_chunk_length_parameter = PiecewiseLinearFn.from_string(
+            self.cfg.chunk_length_parameter
+        )
+        self.curriculum_recurrent_stride = PiecewiseLinearFn.from_string(
+            self.cfg.recurrent_stride
+        )
+        self.curriculum_context_size = PiecewiseLinearFn.from_string(
+            self.cfg.max_context_size
+        )
+        self.curriculum_valid_use_fixed_chunking = PiecewiseBooleanFn.from_string(
+            self.cfg.valid_use_fixed_chunking
+        )
+        self.curriculum_valid_chunk_length_parameter = PiecewiseLinearFn.from_string(
+            self.cfg.valid_chunk_length_parameter
+        )
+
+        self.use_fixed_chunking = None
+        self.recurrent_stride = None
+        self.max_context_size = None
+        self.chunk_length_parameter = None
+        self.valid_use_fixed_chunking = None
+        self.valid_chunk_length_parameter = None
 
     def build_decoder_layer(self, cfg, no_encoder_attn=False):
         if cfg.use_alibi:
@@ -370,7 +415,6 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         end modification of original function
         """
 
-
         # Prevent torchscript exporting issue for dynamic quant embedding
         prev_output_tokens = prev_output_tokens.contiguous()
         # embed tokens and positions
@@ -401,11 +445,21 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         begin modification of original function:
         """
 
+        bottom_layers = list(self.bottom_layers)
+        use_staircase = bool(self.staircase_layers)
+        with set_torch_seed(self.num_updates):
+            if (
+                self.training
+                and (self.cfg.standard_prob is not None)
+                and (np.random.rand() < self.cfg.standard_prob)
+            ):
+                use_staircase = False
+                bottom_layers.extend(self.staircase_layers)
+
         # decoder layers
         attn: Optional[Tensor] = None
         inner_states: List[Optional[Tensor]] = [x]
-        # for idx, layer in enumerate(self.layers):
-        for idx, layer in enumerate(self.bottom_layers):
+        for idx, layer in enumerate(bottom_layers):
             if incremental_state is None and not full_context_alignment:
                 self_attn_mask = self.buffered_future_mask(x)
             else:
@@ -423,7 +477,7 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             inner_states.append(x)
 
         # start of staircase part of decoder
-        if  self.staircase_layers:
+        if use_staircase:
             _, _, edim = x.shape
 
             # we need to make sure that attention for incremental_state behaves the same way as staircase attention
@@ -432,8 +486,16 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             # used a fixed chunk size as scaffolding for now
             fixed_chunk_len = 4
 
-            use_fixed_chunking = self.cfg.use_fixed_chunking if self.training else self.cfg.valid_use_fixed_chunking
-            split_param = self.cfg.chunk_length_parameter if self.training else self.cfg.valid_chunk_length_parameter
+            use_fixed_chunking = (
+                self.use_fixed_chunking
+                if self.training
+                else self.valid_use_fixed_chunking
+            )
+            split_param = (
+                self.chunk_length_parameter
+                if self.training
+                else self.valid_chunk_length_parameter
+            )
             split_param = int(split_param) if use_fixed_chunking else split_param
             if not use_fixed_chunking:
                 rng = np.random.default_rng(seed=hash(prev_output_tokens) % 2**31)
@@ -445,13 +507,13 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                 chunk_lens.append(last_chunk_len)
                 split_param = chunk_lens
 
-
             # x is of shape [SeqLen, Batch, NumHidden]
             chunks = x.split(split_param, dim=0)
             chunk_lens = [chunk.shape[0] for chunk in chunks]
 
             # to store vectors when they reach the output side of the staircase
-            cache = StaircaseCache(max_context_size=self.cfg.max_context_size)
+            cache = StaircaseCache(max_context_size=self.max_context_size)
+            # cache = StaircaseCache(max_context_size=self.cfg.max_context_size)
 
             # queue chunked input so that we only input one chunk a at a time
             chunk_queue = deque(chunks)
@@ -460,7 +522,9 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             # roll staircase randomly during training, this might not be needed
             staircase_start = 0
             if self.training and self.cfg.roll_staircase:
-                staircase_start = torch.randint(0, len(self.staircase_layers), size=[1])[0]
+                staircase_start = torch.randint(
+                    0, len(self.staircase_layers), size=[1]
+                )[0]
             rolled_staircase = (
                 self.staircase_layers[staircase_start:]
                 + self.staircase_layers[:staircase_start]
@@ -477,14 +541,20 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             )
 
             # the maximum number of forwards we need to make
-            myiter = islice(cycle(rolled_staircase), len(chunks) * max(len(self.staircase_layers), self.cfg.recurrent_stride))
+            myiter = islice(
+                cycle(rolled_staircase),
+                len(chunks) * max(len(self.staircase_layers), self.recurrent_stride),
+            )
+            # myiter = islice(cycle(rolled_staircase), len(chunks) * max(len(self.staircase_layers), self.cfg.recurrent_stride))
 
-            recurrence_counter = self.cfg.recurrent_stride
+            recurrence_counter = self.recurrent_stride
+            # recurrence_counter = self.cfg.recurrent_stride
             while True:
                 # ic(nforwards_per_chunk[:nchunks_in_staircase+1])
                 layer = next(myiter)
 
-                if chunk_queue and self.cfg.recurrent_stride <= recurrence_counter:
+                if chunk_queue and self.recurrent_stride <= recurrence_counter:
+                    # if chunk_queue and self.cfg.recurrent_stride <= recurrence_counter:
                     recurrence_counter = 0
                     next_chunk = chunk_queue.popleft()
                     x = torch.cat([x, next_chunk], dim=0)
@@ -502,18 +572,30 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                 nqueries = x.shape[0]
                 curr_self_attn_mask = self_attn_mask
                 if extra_state is not None:
-                    assert self_attn_mask.dtype in (torch.float16, torch.float32, torch.float64)
+                    assert self_attn_mask.dtype in (
+                        torch.float16,
+                        torch.float32,
+                        torch.float64,
+                    )
                     # assert isinstance(self_attn_mask, torch.FloatTensor) or isinstance(self_attn_mask, torch.FloatTensor)
                     # mask is additive, not multiplicative, so a value of zero means a given position is included
                     # shape: [Time, Batch, Embed]
                     num_extra_keys = extra_state.shape[0]
                     # mask shape: [NumQueries, NumKeys]
-                    curr_self_attn_mask = torch.cat([self_attn_mask.new_zeros(nqueries, num_extra_keys), self_attn_mask], dim=1)
+                    curr_self_attn_mask = torch.cat(
+                        [
+                            self_attn_mask.new_zeros(nqueries, num_extra_keys),
+                            self_attn_mask,
+                        ],
+                        dim=1,
+                    )
 
                 curr_self_attn_padding_mask = self_attn_padding_mask
                 if self_attn_padding_mask is not None:
                     # mask shape: [Batch, Time]
-                    curr_self_attn_padding_mask = self_attn_padding_mask[:, cache.num_forgotten:cache.length + nqueries]
+                    curr_self_attn_padding_mask = self_attn_padding_mask[
+                        :, cache.num_forgotten : cache.length + nqueries
+                    ]
 
                 x, layer_attn, _ = layer(
                     x,
@@ -530,7 +612,9 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                 if x.isnan().any() and self_attn_padding_mask is not None:
                     # xformer attentions have a nan bug when using masks: https://github.com/facebookresearch/xformers/issues/631
                     # [Batch, Time] -> [Time, Batch]; to match x
-                    query_padding_mask = self_attn_padding_mask[:, cache.length:cache.length + nqueries].transpose(0, 1)
+                    query_padding_mask = self_attn_padding_mask[
+                        :, cache.length : cache.length + nqueries
+                    ].transpose(0, 1)
                     x[query_padding_mask] = 0
 
                 # XXX: if we skip a layer due to layerdrop, we still want to count it in staircase_nforwards,
@@ -549,7 +633,8 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                     # cache all the vectors from those chunks (can be mnore than one chunk)
                     nvecs_to_be_cached = sum(
                         chunk_lens[
-                            nfinished_chunks : nfinished_chunks + nchunks_finished_this_forward
+                            nfinished_chunks : nfinished_chunks
+                            + nchunks_finished_this_forward
                         ]
                     )
                     # partition x into next inputs and cached inputs
@@ -601,6 +686,27 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             x = self.project_out_dim(x)
 
         return x, {"attn": [attn], "inner_states": inner_states}
+
+    def set_num_updates(self, num_updates):
+        # copy from fairseq.models.fairseq_model
+        """State from trainer to pass along to model at every update."""
+        self.num_updates = num_updates
+        self.use_fixed_chunking = self.curriculum_use_fixed_chunking(num_updates)
+        self.recurrent_stride = self.curriculum_recurrent_stride(num_updates)
+        self.chunk_length_parameter = self.curriculum_chunk_length_parameter(
+            num_updates
+        )
+        self.valid_use_fixed_chunking = self.curriculum_valid_use_fixed_chunking(
+            num_updates
+        )
+        self.valid_chunk_length_parameter = (
+            self.curriculum_valid_chunk_length_parameter(num_updates)
+        )
+        self.max_context_size = self.curriculum_context_size(num_updates)
+
+        for m in self.modules():
+            if hasattr(m, "set_num_updates") and m != self:
+                m.set_num_updates(num_updates)  # type: ignore
 
 
 class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
@@ -781,7 +887,7 @@ class StaircaseTransformerDecoderLayerBase(TransformerDecoderLayerBase):
         self, embed_dim, cfg, add_bias_kv=False, add_zero_attn=False
     ):
         return multihead_rotary_attention.MultiheadRotaryAttention(
-        # return MultiheadAttention(
+            # return MultiheadAttention(
             embed_dim,
             cfg.decoder.attention_heads,
             dropout=cfg.attention_dropout,
