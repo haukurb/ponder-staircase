@@ -41,6 +41,7 @@ from fairseq.models.transformer.transformer_decoder import TransformerDecoderBas
 from fairseq.modules import MultiheadAttention
 from fairseq.models.transformer_lm import TransformerLanguageModel
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
+from fairseq.modules import LearnedPositionalEmbedding
 from fairseq.modules.transformer_layer import TransformerDecoderLayerBase
 from fairseq.dataclass import ChoiceEnum
 from fairseq.utils import safe_getattr, set_torch_seed
@@ -68,6 +69,7 @@ POSITION_ENCODING_CHOICES = ChoiceEnum(
         "xpos",
         "rope",
         "none",
+        "abs",
     ]
 )
 
@@ -90,7 +92,7 @@ class StaircaseCache:
         self.unmerged_chunks: List[torch.Tensor] = []
         self._depths: List[int] = []
         self.chunk_lengths: List[int] = []
-        self.max_context_size = max_context_size if max_context_size >= 0 else None
+        self.max_context_size: Optional[int] = max_context_size if (max_context_size and max_context_size >= 0) else None
         self.max_unconsolidated: int = 4
         self.valid_cache = True  # for cache invalidation
         # we don't need to recompute state tensor if nothing has been added to the cache
@@ -232,7 +234,7 @@ class StaircaseTransformerDecoderModel(TransformerLanguageModel):
 
     def __init__(self, decoder):
         super().__init__(decoder)
-        self.num_updates = 0
+        self.set_num_updates(0)
 
     @classmethod
     def build_model(cls, cfg, task):
@@ -308,6 +310,9 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         self.curriculum_valid_chunk_length_parameter = PiecewiseLinearFn.from_string(
             self.cfg.valid_chunk_length_parameter
         )
+        self.embed_abs_pos = None
+        if self.cfg.position_encoding == POSITION_ENCODING_CHOICES.abs:  # type: ignore
+            self.embed_abs_pos = LearnedPositionalEmbedding(self.cfg.max_target_positions, self.embed_dim,  padding_idx=None)
 
         self.use_fixed_chunking = None
         self.recurrent_stride = None
@@ -340,6 +345,33 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         else:
             return features
 
+    def forward(
+        self,
+        prev_output_tokens,
+        encoder_out: Optional[Dict[str, List[Tensor]]] = None,
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        features_only: bool = False,
+        full_context_alignment: bool = False,
+        alignment_layer: Optional[int] = None,
+        alignment_heads: Optional[int] = None,
+        src_lengths: Optional[Any] = None,
+        return_all_hiddens: bool = False,
+        positions: Optional[Tensor]=None,
+    ):
+        x, extra = self.extract_features(
+            prev_output_tokens,
+            encoder_out=encoder_out,
+            incremental_state=incremental_state,
+            full_context_alignment=full_context_alignment,
+            alignment_layer=alignment_layer,
+            alignment_heads=alignment_heads,
+            positions=positions,
+        )
+
+        if not features_only:
+            x = self.output_layer(x)
+        return x, extra
+
     """
     self.forward delegates to this function
 
@@ -347,6 +379,27 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
     super().extract_features, but super() is not supported in torchscript. A copy of
     this function is made to be used in the subclass instead.
     """
+
+    def extract_features(
+        self,
+        prev_output_tokens,
+        encoder_out: Optional[Dict[str, List[Tensor]]],
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        full_context_alignment: bool = False,
+        alignment_layer: Optional[int] = None,
+        alignment_heads: Optional[int] = None,
+        src_lengths: Optional[Tensor]=None,
+        positions: Optional[Tensor]=None,
+    ):
+        return self.extract_features_scriptable(
+            prev_output_tokens,
+            encoder_out=encoder_out,
+            incremental_state=incremental_state,
+            full_context_alignment=full_context_alignment,
+            alignment_layer=alignment_layer,
+            alignment_heads=alignment_heads,
+            positions=positions,
+        )
 
     def extract_features_scriptable(
         self,
@@ -356,6 +409,7 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
+        positions: Optional[Tensor]=None,
     ):
         """
         Similar to *forward* but only return features.
@@ -399,12 +453,12 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
 
         """
 
-        # # embed positions
-        # positions = None
-        # if self.embed_positions is not None:
-        #     positions = self.embed_positions(
-        #         prev_output_tokens, incremental_state=incremental_state
-        #     )
+        # can be None if it is we are using xpos or rope
+        pos_embeddings = None
+        if self.embed_positions is not None and self.cfg.position_encoding == POSITION_ENCODING_CHOICES.abs:
+            assert positions is not None
+            assert incremental_state is None
+            pos_embeddings = self.embed_abs_pos(None, positions=positions)
 
         # if incremental_state is not None:
         #     prev_output_tokens = prev_output_tokens[:, -1:]
@@ -426,8 +480,10 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
         if self.project_in_dim is not None:
             x = self.project_in_dim(x)
 
-        # if positions is not None:
-        #     x += positions
+        if pos_embeddings is not None:
+            x += pos_embeddings
+        else:
+            assert self.cfg.position_encoding in (POSITION_ENCODING_CHOICES.rope, POSITION_ENCODING_CHOICES.xpos, POSITION_ENCODING_CHOICES.none)  # type: ignore
 
         if self.layernorm_embedding is not None:
             x = self.layernorm_embedding(x)
@@ -496,6 +552,8 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                 if self.training
                 else self.valid_chunk_length_parameter
             )
+            assert split_param is not None
+
             split_param = int(split_param) if use_fixed_chunking else split_param
             if not use_fixed_chunking:
                 rng = np.random.default_rng(seed=hash(prev_output_tokens) % 2**31)
@@ -511,8 +569,9 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
             chunks = x.split(split_param, dim=0)
             chunk_lens = [chunk.shape[0] for chunk in chunks]
 
+            assert self.max_context_size is not None
             # to store vectors when they reach the output side of the staircase
-            cache = StaircaseCache(max_context_size=self.max_context_size)
+            cache = StaircaseCache(max_context_size=int(self.max_context_size))
             # cache = StaircaseCache(max_context_size=self.cfg.max_context_size)
 
             # queue chunked input so that we only input one chunk a at a time
@@ -540,14 +599,15 @@ class StaircaseTransformerDecoder(TransformerDecoderBase):
                 0  # number of chunks removed from staircase after they are finalized
             )
 
+            assert self.recurrent_stride is not None
             # the maximum number of forwards we need to make
             myiter = islice(
                 cycle(rolled_staircase),
-                len(chunks) * max(len(self.staircase_layers), self.recurrent_stride),
+                len(chunks) * max(len(self.staircase_layers), int(self.recurrent_stride)),
             )
             # myiter = islice(cycle(rolled_staircase), len(chunks) * max(len(self.staircase_layers), self.cfg.recurrent_stride))
 
-            recurrence_counter = self.recurrent_stride
+            recurrence_counter = int(self.recurrent_stride)
             # recurrence_counter = self.cfg.recurrent_stride
             while True:
                 # ic(nforwards_per_chunk[:nchunks_in_staircase+1])

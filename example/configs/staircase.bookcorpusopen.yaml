@@ -28,6 +28,7 @@ model:
       ffn_embed_dim: 2560
       attention_heads: 10
       xformers_att_config: '{"name":"scaled_dot_product"}'
+      learned_pos: true
 
 
 task:

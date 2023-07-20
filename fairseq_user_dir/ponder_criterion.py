@@ -59,9 +59,11 @@ class CrossEntropyWithPonderCriterion(FairseqCriterion):
         ncorrect_tokens = sum([pred.eq(tgt)[:-1].sum().item() for (pred, tgt) in zip(pred_per_seq, targets_per_seq)])
         ntarget_tokens = sum((len(tgt) - 1) for tgt in targets_per_seq)
 
+        ntokens = sample_size = sample["loss_keep_mask"].sum()
         logging_output = {
             "loss": loss.data,
-            "ntokens": sample["ntokens"],
+            "ntokens": ntokens,
+            # "ntokens": sample["ntokens"],
             "nsentences": sample["target"].size(0),
             "ncorrect_seqs": ncorrect_seqs,
             "ncorrect_tokens": ncorrect_tokens,
