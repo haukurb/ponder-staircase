@@ -124,9 +124,15 @@ ENV/
 /metaseq/version.py
 
 # data
-data-bin/
-data/*
-data-*/*
+data-bin
+data
+data-*
+log.*.txt
+log.txt
+checkpoints
+logs.*
+outputs
+writingprompts
 
 # reranking
 /examples/reranking/rerank_data
