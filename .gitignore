@@ -130,9 +130,14 @@ data-*
 log.*.txt
 log.txt
 checkpoints
+*.pt
 logs.*
 outputs
 writingprompts
+
+torchscale
+metaseq
+transformer-sequential
 
 # reranking
 /examples/reranking/rerank_data
